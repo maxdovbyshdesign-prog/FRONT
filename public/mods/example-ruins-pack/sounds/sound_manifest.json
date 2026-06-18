@@ -1,0 +1,14 @@
+{
+  "sounds": [
+    {
+      "id": "block_place_custom",
+      "path": "sounds/place.mp3",
+      "category": "block"
+    },
+    {
+      "id": "block_destroy_custom",
+      "path": "sounds/destroy.mp3",
+      "category": "block"
+    }
+  ]
+}

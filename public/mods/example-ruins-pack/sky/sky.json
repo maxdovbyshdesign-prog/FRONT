@@ -1,0 +1,8 @@
+{
+  "skyColor": "#12081f",
+  "dayColor": "#241331",
+  "nightColor": "#05010a",
+  "fogColor": "#3b2630",
+  "fogStart": 50,
+  "fogEnd": 110
+}

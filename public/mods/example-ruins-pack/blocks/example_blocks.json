@@ -1,0 +1,75 @@
+[
+  {
+    "id": "example:ash_stone",
+    "name": "Ash Stone",
+    "materialName": "ash-stone",
+    "color": [0.28, 0.24, 0.22],
+    "solid": true,
+    "opaque": true,
+    "baseValue": 10,
+    "description": "Seared pumice rubble formed from volcanic atmospheric drop-outs.",
+    "tags": ["structure", "basalt"],
+    "material": {
+      "type": "standard",
+      "diffuseTexture": "/mods/example-ruins-pack/textures/ash_stone_albedo.png",
+      "normalTexture": "/mods/example-ruins-pack/textures/ash_stone_normal.png",
+      "roughness": 0.9,
+      "specularColor": [0.08, 0.06, 0.05]
+    }
+  },
+  {
+    "id": "example:glowing_crystal",
+    "name": "Glowing Crystal",
+    "materialName": "glowing-crystal",
+    "color": [0.0, 0.95, 0.75],
+    "solid": true,
+    "opaque": true,
+    "baseValue": 25,
+    "description": "A radiant alien geode filled with piezo-luminescent silicate structures.",
+    "tags": ["crystal", "luminescent", "light_source"],
+    "material": {
+      "type": "standard",
+      "diffuseTexture": "/mods/example-ruins-pack/textures/glowing_crystal_albedo.png",
+      "emissiveTexture": "/mods/example-ruins-pack/textures/glowing_crystal_emissive.png",
+      "emissiveColor": [0.0, 0.95, 0.75],
+      "emissiveStrength": 1.1,
+      "roughness": 0.25,
+      "metallic": 0.1
+    },
+    "light": {
+      "kind": "point",
+      "color": [0.0, 0.95, 0.75],
+      "intensity": 1.6,
+      "range": 14,
+      "emissiveStrength": 1.0,
+      "priority": 4
+    }
+  },
+  {
+    "id": "example:green_bunker_lamp",
+    "name": "Green Bunker Lamp",
+    "materialName": "example-green-bunker-lamp",
+    "color": [0.2, 1.0, 0.45],
+    "solid": true,
+    "opaque": false,
+    "baseValue": 22,
+    "description": "Toxic-green emergency bunker fixture. Pairs a steady emissive glow with a soft dynamic point light.",
+    "tags": ["light_source", "utility"],
+    "material": {
+      "type": "standard",
+      "diffuseTexture": "/mods/example-ruins-pack/textures/green_bunker_lamp_albedo.png",
+      "normalTexture": "/mods/example-ruins-pack/textures/green_bunker_lamp_normal.png",
+      "emissiveTexture": "/mods/example-ruins-pack/textures/green_bunker_lamp_emissive.png",
+      "emissiveColor": [0.2, 1.0, 0.45],
+      "emissiveStrength": 1.0,
+      "roughness": 0.5
+    },
+    "light": {
+      "kind": "point",
+      "color": [0.2, 1.0, 0.45],
+      "intensity": 1.4,
+      "range": 18,
+      "priority": 5
+    }
+  }
+]

@@ -1,0 +1,55 @@
+{
+  "name": "frontier-planet",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "main": "main-electron.cjs",
+  "description": "Voxel sci-fi extraction survival RPG standalone vertical slice",
+  "author": "Frontier Planet Contractor Syndicate",
+  "scripts": {
+    "dev": "vite --port=3000 --host=0.0.0.0",
+    "build": "vite build",
+    "preview": "vite preview",
+    "clean": "rm -rf dist release",
+    "lint": "tsc --noEmit",
+    "package:win": "electron-builder --win --x64",
+    "release:win": "npm run build && npm run package:win && echo '=== BUILD SUCCESSFUL ===' && echo 'ZIP ARTIFACT COMPLETED AT: /release/FrontierPlanet-0.0.0-win.zip'"
+  },
+  "build": {
+    "appId": "com.frontierplanet.game",
+    "productName": "FrontierPlanet",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "main-electron.cjs"
+    ],
+    "win": {
+      "target": [
+        "zip"
+      ]
+    }
+  },
+  "dependencies": {
+    "@babylonjs/core": "^6.49.0",
+    "@tailwindcss/vite": "^4.1.14",
+    "@vitejs/plugin-react": "^5.0.4",
+    "lucide-react": "^0.546.0",
+    "noa-engine": "^0.33.0",
+    "react": "^19.0.1",
+    "react-dom": "^19.0.1",
+    "vite": "^6.2.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.14.0",
+    "autoprefixer": "^10.4.21",
+    "electron": "^42.4.1",
+    "electron-builder": "^26.15.3",
+    "esbuild": "^0.25.0",
+    "tailwindcss": "^4.1.14",
+    "tsx": "^4.21.0",
+    "typescript": "~5.8.2",
+    "vite": "^6.2.3"
+  }
+}

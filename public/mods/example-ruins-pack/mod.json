@@ -1,0 +1,15 @@
+{
+  "id": "example_ruins_pack",
+  "name": "Example Ruins Pack",
+  "version": "0.1.0",
+  "author": "Frontier Planet",
+  "description": "Example custom ruins and blocks.",
+  "content": {
+    "blocks": ["blocks/example_blocks.json"],
+    "structures": ["structures/example_shrine.fpstructure.json"],
+    "placement": ["placement/example_placement.json"],
+    "uiThemes": ["ui/theme.json"],
+    "sounds": ["sounds/sound_manifest.json"],
+    "sky": ["sky/sky.json"]
+  }
+}

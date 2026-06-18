@@ -1,0 +1,12 @@
+{
+  "placements": [
+    {
+      "structureId": "example:small_shrine",
+      "biomes": ["red_wasteland"],
+      "rarity": 0.12,
+      "minDistanceFromSpawn": 45,
+      "maxPerRegion": 2,
+      "requiresFlatGround": true
+    }
+  ]
+}

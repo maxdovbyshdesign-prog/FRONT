@@ -1,0 +1,6 @@
+{
+  "name": "Frontier Planet",
+  "description": "Voxel sci-fi extraction survival RPG vertical slice. Explore, excavate material blocks, find ancient artifacts, and return safely to the spawn extraction pad.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
