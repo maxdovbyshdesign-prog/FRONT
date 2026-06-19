@@ -36,6 +36,23 @@ export class ModRegistry {
   private activeSky: ModSkyConfig = {};
   private activeSounds: ModSoundManifest = { sounds: [] };
 
+  /**
+   * Sources that contributed each active-sky field, for F3 debug readback.
+   * Keyed by field name → human-readable source string (mod id / file path).
+   */
+  private activeSkySources: Record<string, string> = {};
+
+  /**
+   * Runtime master toggle for the mod sky overlay. DEFAULT OFF.
+   *
+   * The old behavior merged ModRegistry.getActiveSky() into the live visual
+   * preset every frame, which silently let legacy example-ruins-pack/sky/sky.json
+   * (purple #12081f / #3b2630) dominate the built-in presets and turned the
+   * world into a purple void. The overlay is now OPT-IN: it only applies when
+   * this flag is true, and F3 labels it explicitly.
+   */
+  private modSkyOverlayEnabled: boolean = false;
+
   private nextBlockId: number = 10; // Start custom block IDs from 10
 
   private constructor() {
@@ -86,9 +103,41 @@ export class ModRegistry {
     console.log('[ModRegistry] UI Modded Theme overridden:', this.activeTheme);
   }
 
-  public applySkyConfig(sky: ModSkyConfig): void {
+  /**
+   * Merge a mod sky config into the active overlay. Also records which mod
+   * supplied each field so F3 can show "skyColor source: example-ruins-pack".
+   * NOTE: this only REGISTERS the overlay — it does NOT enable it. The overlay
+   * is applied to the scene only when `setModSkyOverlayEnabled(true)` is called
+   * (default OFF). See `modSkyOverlayEnabled`.
+   */
+  public applySkyConfig(sky: ModSkyConfig, sourceId?: string): void {
+    const src = sourceId ?? 'unknown-mod';
     this.activeSky = { ...this.activeSky, ...sky };
-    console.log('[ModRegistry] Sky overlay settings updated:', this.activeSky);
+    for (const k of Object.keys(sky)) {
+      this.activeSkySources[k] = src;
+    }
+    console.log(`[ModRegistry] Sky overlay registered from "${src}" (overlay is ${this.modSkyOverlayEnabled ? 'ON' : 'OFF'}):`, this.activeSky);
+  }
+
+  /** Enable/disable the mod sky overlay at runtime (F3 debug toggle). */
+  public setModSkyOverlayEnabled(enabled: boolean): void {
+    this.modSkyOverlayEnabled = !!enabled;
+    console.log(`[ModRegistry] Mod sky overlay ${this.modSkyOverlayEnabled ? 'ENABLED' : 'DISABLED'}.`);
+  }
+
+  /** Whether the mod sky overlay is currently applied to the scene. */
+  public isModSkyOverlayEnabled(): boolean {
+    return this.modSkyOverlayEnabled;
+  }
+
+  /** True if any mod has registered a sky overlay (whether or not it is enabled). */
+  public hasModSkyOverlay(): boolean {
+    return Object.keys(this.activeSky).length > 0;
+  }
+
+  /** Source string per field (e.g. { skyColor: 'example-ruins-pack' }). */
+  public getActiveSkySources(): Record<string, string> {
+    return { ...this.activeSkySources };
   }
 
   public registerSounds(sounds: ModSoundManifest): void {
@@ -180,6 +229,8 @@ export class ModRegistry {
     this.placementRules = [];
     this.activeTheme = {};
     this.activeSky = {};
+    this.activeSkySources = {};
+    this.modSkyOverlayEnabled = false;
     this.activeSounds = { sounds: [] };
     this.nextBlockId = 10;
   }

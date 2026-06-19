@@ -78,6 +78,19 @@ export class MaterialService {
   private maxSimultaneousLights: number;
   private safeMaterialsMode: boolean;
   private customTerrainMaterialsMode: boolean;
+  /**
+   * When true (default), ALL opaque solid blocks get a LIT StandardMaterial
+   * (disableLighting=false, emissiveColor=0, maxSimultaneousLights=8,
+   * fogEnabled=true, ambientColor=1,1,1) instead of noa's internal flat-color
+   * material. This is REQUIRED so that:
+   *   - day/night actually darkens terrain (noa's default material receives a
+   *     constant 0.5 scene.ambientColor fill that prevents darkness)
+   *   - placed dynamic PointLights illuminate nearby terrain
+   *   - the Full Dark / Lamp Only tests work
+   * Textures still load gracefully (attached only on successful load, so a
+   * missing texture never breaks material.isReady()).
+   */
+  private litTerrainMaterials: boolean;
   private built: Set<string> = new Set();
   private warnedMissing: Set<string> = new Set();
   private materials: BABYLON.StandardMaterial[] = [];
@@ -88,7 +101,8 @@ export class MaterialService {
     maxSimultaneousLights: number = DEFAULT_MAX_SIMULTANEOUS_LIGHTS,
     noaRendering: NoaRenderingLike | null = null,
     safeMaterialsMode: boolean = readSafeMaterialsMode(),
-    customTerrainMaterialsMode: boolean = readCustomTerrainMaterialsMode()
+    customTerrainMaterialsMode: boolean = readCustomTerrainMaterialsMode(),
+    litTerrainMaterials: boolean = true
   ) {
     this.scene = scene;
     this.registry = registry;
@@ -96,8 +110,9 @@ export class MaterialService {
     this.maxSimultaneousLights = maxSimultaneousLights;
     this.safeMaterialsMode = safeMaterialsMode;
     this.customTerrainMaterialsMode = customTerrainMaterialsMode;
+    this.litTerrainMaterials = litTerrainMaterials;
     console.log(
-      `[MaterialService] Block material pipeline online. maxSimultaneousLights = ${maxSimultaneousLights}, safeMaterialsMode = ${safeMaterialsMode}, customTerrainMaterialsMode = ${customTerrainMaterialsMode}.`
+      `[MaterialService] Block material pipeline online. maxSimultaneousLights = ${maxSimultaneousLights}, safeMaterialsMode = ${safeMaterialsMode}, customTerrainMaterialsMode = ${customTerrainMaterialsMode}, litTerrainMaterials = ${litTerrainMaterials}.`
     );
   }
 
@@ -155,13 +170,17 @@ export class MaterialService {
       (!!block.material.emissiveColor ||
         !!block.material.emissiveTexture ||
         !!block.material.emissiveStrength);
+    // LIT TERRAIN MODE: build a lit StandardMaterial for ordinary opaque blocks
+    // so day/night + dynamic lights affect terrain. This is the default.
     const needsCustomMaterial =
       this.customTerrainMaterialsMode ||
+      this.litTerrainMaterials ||
       isLightSource ||
       hasEmissiveConfig;
 
-    // DEFAULT MODE: ordinary opaque block with no emissive needs → use noa's
-    // flat-color registration. noa builds its own proven terrain material.
+    // DEFAULT MODE (only when litTerrainMaterials is OFF): ordinary opaque
+    // block with no emissive needs → use noa's flat-color registration. noa
+    // builds its own proven (but unlit-with-respect-to-dynamic-lights) material.
     if (!needsCustomMaterial) {
       this.registry.registerMaterial(block.materialName, { color: block.color });
       this.registry.registerBlock(block.id, {
@@ -170,7 +189,7 @@ export class MaterialService {
         opaque: block.opaque !== false,
       });
       console.log(
-        `[MaterialService] registered flat color for ${block.materialName} (noa default material).`
+        `[MaterialService] registered flat color for ${block.materialName} (noa default material, litTerrainMaterials OFF).`
       );
       return;
     }

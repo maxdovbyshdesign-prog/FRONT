@@ -27,6 +27,9 @@ export class RenderPipelineService {
   private glowLayer: BABYLON.GlowLayer | null = null;
   private pipeline: BABYLON.DefaultRenderingPipeline | null = null;
   private disposed = false;
+  /** Track current states so repeated calls (every frame) don't spam logs. */
+  private glowEnabledCurrent: boolean | null = null;
+  private bloomEnabledCurrent: boolean | null = null;
 
   constructor(
     scene: BABYLON.Scene,
@@ -188,9 +191,12 @@ export class RenderPipelineService {
   }
 
   /**
-   * Toggle GlowLayer on/off at runtime (QA debug).
+   * Toggle GlowLayer on/off at runtime (QA debug). Idempotent: skips work + log
+   * when the value hasn't changed (called every frame by applyAtmosphere).
    */
   public setGlowEnabled(enabled: boolean): void {
+    if (this.glowEnabledCurrent === enabled) return;
+    this.glowEnabledCurrent = enabled;
     try {
       if (this.glowLayer) {
         this.glowLayer.intensity = enabled ? this.settings.glowIntensity : 0;
@@ -202,9 +208,11 @@ export class RenderPipelineService {
   }
 
   /**
-   * Toggle bloom on/off at runtime (QA debug).
+   * Toggle bloom on/off at runtime (QA debug). Idempotent.
    */
   public setBloomEnabled(enabled: boolean): void {
+    if (this.bloomEnabledCurrent === enabled) return;
+    this.bloomEnabledCurrent = enabled;
     try {
       if (this.pipeline) {
         this.pipeline.bloomEnabled = enabled;
@@ -278,6 +286,10 @@ export class RenderPipelineService {
     } catch {
       /* ignore */
     }
+    // Reset idempotency trackers so the next setGlowEnabled/setBloomEnabled
+    // re-applies after a pipeline rebuild.
+    this.glowEnabledCurrent = null;
+    this.bloomEnabledCurrent = null;
   }
 
   public dispose(): void {

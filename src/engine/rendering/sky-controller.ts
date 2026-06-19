@@ -44,6 +44,16 @@ export interface SkyUpdateResult {
 export class SkyController {
   private scene: BABYLON.Scene;
   private settings: GraphicsSettings;
+  /**
+   * Optional callback to register a mesh with noa's octree (dynamicContent).
+   * CRITICAL: noa's OctreeSceneComponent overrides scene.getActiveMeshCandidates
+   * to return only meshes registered with the octree. Sky meshes created via
+   * MeshBuilder are NOT registered by default, so they're never evaluated as
+   * active meshes and NEVER RENDER — even with alwaysSelectAsActiveMesh=true.
+   * The adapter passes `(mesh) => noa.rendering._octreeManager.addMesh(mesh, false)`
+   * so each celestial mesh is added to the octree's dynamic content list.
+   */
+  private registerWithOctree: ((mesh: BABYLON.AbstractMesh) => void) | null;
 
   /** Root node that follows the player every frame. All sky bodies are parented to it. */
   private skyRoot: BABYLON.TransformNode | null = null;
@@ -59,6 +69,22 @@ export class SkyController {
 
   private sunLight: BABYLON.DirectionalLight | null = null;
   private ambientLight: BABYLON.HemisphericLight | null = null;
+  /**
+   * Separate cool moon fill light at night. A second HemisphericLight is cheap
+   * and stable; its intensity is driven by the night factor so the scene gets a
+   * faint blue moonlight at midnight (distinct from the warm sun).
+   */
+  private moonLight: BABYLON.HemisphericLight | null = null;
+
+  /**
+   * MASTER enable for all sky meshes. When false, setVisibilityOverrides()
+   * disables sun/moon/stars/clouds regardless of the per-body flags. This is
+   * what "Sky Off / Sky On" flips — previously those buttons called
+   * setVisible() which set setEnabled(), but applyAtmosphereForCurrentPhase()
+   * re-enabled the meshes every frame via setVisibilityOverrides(), so the
+   * buttons appeared to do nothing.
+   */
+  private meshesEnabled: boolean = true;
 
   /** Orbital radius for sun/moon (voxels from player). Kept within camera maxZ. */
   private readonly radius = 300;
@@ -69,9 +95,14 @@ export class SkyController {
 
   private disposed = false;
 
-  constructor(scene: BABYLON.Scene, settings: GraphicsSettings) {
+  constructor(
+    scene: BABYLON.Scene,
+    settings: GraphicsSettings,
+    registerWithOctree?: ((mesh: BABYLON.AbstractMesh) => void) | null
+  ) {
     this.scene = scene;
     this.settings = settings;
+    this.registerWithOctree = registerWithOctree ?? null;
     console.log("[SkyController] Initializing celestial system...");
     this.ensureCameraFarPlane();
     this.buildLights();
@@ -116,10 +147,37 @@ export class SkyController {
     );
     this.ambientLight.intensity = 0.4;
     this.ambientLight.groundColor = new BABYLON.Color3(0.12, 0.08, 0.10);
+
+    // Cool moon fill light. Starts at intensity 0; driven up at night in update().
+    this.moonLight = new BABYLON.HemisphericLight(
+      "fp_moon_light",
+      new BABYLON.Vector3(0, -1, 0),
+      this.scene
+    );
+    this.moonLight.intensity = 0.0;
+    this.moonLight.diffuse = new BABYLON.Color3(0.30, 0.40, 0.60);
+    this.moonLight.groundColor = new BABYLON.Color3(0.05, 0.06, 0.10);
+    this.moonLight.specular = new BABYLON.Color3(0.05, 0.07, 0.12);
   }
 
   private buildSkyRoot(): void {
     this.skyRoot = new BABYLON.TransformNode("fp_sky_root", this.scene);
+  }
+
+  /**
+   * Register a mesh with noa's octree so it actually renders. Without this,
+   * noa's OctreeSceneComponent excludes the mesh from active-mesh candidates
+   * (it only returns octree-registered meshes), so the celestial body is
+   * invisible regardless of alwaysSelectAsActiveMesh / isVisible / setEnabled.
+   */
+  private register(mesh: BABYLON.AbstractMesh): void {
+    if (this.registerWithOctree) {
+      try {
+        this.registerWithOctree(mesh);
+      } catch (e) {
+        console.warn("[SkyController] octree registration failed for", mesh.name, e);
+      }
+    }
   }
 
   /**
@@ -150,6 +208,7 @@ export class SkyController {
     mesh.applyFog = false;
     mesh.renderingGroupId = 0; // same group as terrain — natural depth sorting
     mesh.alwaysSelectAsActiveMesh = true; // never frustum-cull
+    this.register(mesh);
     return { mesh, mat };
   }
 
@@ -212,6 +271,7 @@ export class SkyController {
       star.applyFog = false;
       star.renderingGroupId = 0;
       star.alwaysSelectAsActiveMesh = true;
+      this.register(star);
 
       this.stars.push(star);
       this.starMats.push(mat);
@@ -246,6 +306,7 @@ export class SkyController {
       cloud.applyFog = false;
       cloud.renderingGroupId = 0;
       cloud.alwaysSelectAsActiveMesh = true;
+      this.register(cloud);
 
       this.clouds.push(cloud);
       this.cloudMats.push(mat);
@@ -332,6 +393,13 @@ export class SkyController {
       this.starMats[i].alpha = nightFactor * this._starBrightnessOverride;
     }
 
+    // Moon fill light: driven by nightFactor and the VisualTuning override.
+    if (this.moonLight) {
+      this.moonLight.intensity = this._moonLightEnabled
+        ? nightFactor * this._moonLightIntensity
+        : 0.0;
+    }
+
     // Clouds: drift + dim at night.
     const cloudDay = altitude > 0.1
       ? 1.0
@@ -362,22 +430,45 @@ export class SkyController {
     return this.ambientLight;
   }
 
+  public getMoonLight(): BABYLON.HemisphericLight | null {
+    return this.moonLight;
+  }
+
   /**
-   * Toggle visibility of all sky meshes (sun, moon, stars, clouds) for QA.
-   * Used by window.__fpDebug().setSkyVisible(false) to isolate whether sky
-   * meshes are occluding terrain.
+   * MASTER sky-mesh enable toggle. This is what "Sky Off / Sky On" flips.
+   * It persists across frames because setVisibilityOverrides() reads it every
+   * frame — unlike the old setVisible() one-shot which was immediately undone.
+   */
+  public setMeshesEnabled(enabled: boolean): void {
+    this.meshesEnabled = enabled;
+    console.log(`[SkyController] Sky meshes master ${enabled ? "ENABLED" : "DISABLED"}.`);
+  }
+
+  public isMeshesEnabled(): boolean {
+    return this.meshesEnabled;
+  }
+
+  /**
+   * Legacy one-shot visibility toggle. Kept for backward compatibility but now
+   * also flips the master flag so it actually persists.
    */
   public setVisible(visible: boolean): void {
-    if (this.sunMesh) this.sunMesh.setEnabled(visible);
-    if (this.moonMesh) this.moonMesh.setEnabled(visible);
-    for (const s of this.stars) s.setEnabled(visible);
-    for (const c of this.clouds) c.setEnabled(visible);
-    console.log(`[SkyController] Sky meshes ${visible ? "enabled" : "disabled"}.`);
+    this.setMeshesEnabled(visible);
+  }
+
+  /**
+   * Moon light runtime config (driven by VisualTuning).
+   */
+  public setMoonLight(opts: { enabled: boolean; intensity: number }): void {
+    this._moonLightEnabled = opts.enabled;
+    this._moonLightIntensity = Math.max(0, opts.intensity);
   }
 
   /**
    * Apply granular visibility overrides from the VisualTuning console.
-   * Each celestial body type can be toggled independently.
+   * Each celestial body type can be toggled independently — BUT the master
+   * `meshesEnabled` flag gates ALL of them. When master is off, everything is
+   * disabled regardless of the per-body flags. This is why "Sky Off" now works.
    */
   public setVisibilityOverrides(opts: {
     sunVisible: boolean;
@@ -386,16 +477,23 @@ export class SkyController {
     cloudsVisible: boolean;
     starBrightness: number;
   }): void {
+    this._starBrightnessOverride = opts.starBrightness;
+    if (!this.meshesEnabled) {
+      if (this.sunMesh) this.sunMesh.setEnabled(false);
+      if (this.moonMesh) this.moonMesh.setEnabled(false);
+      for (const s of this.stars) s.setEnabled(false);
+      for (const c of this.clouds) c.setEnabled(false);
+      return;
+    }
     if (this.sunMesh) this.sunMesh.setEnabled(opts.sunVisible);
     if (this.moonMesh) this.moonMesh.setEnabled(opts.moonVisible);
     for (const s of this.stars) s.setEnabled(opts.starsVisible);
     for (const c of this.clouds) c.setEnabled(opts.cloudsVisible);
-    // Star brightness = alpha multiplier. Applied in update() via nightFactor,
-    // but we also store it for the update loop to use.
-    this._starBrightnessOverride = opts.starBrightness;
   }
 
   private _starBrightnessOverride: number = 1.0;
+  private _moonLightEnabled: boolean = true;
+  private _moonLightIntensity: number = 0.25;
 
   /**
    * Return the current celestial body positions (world space) for debug.
@@ -407,6 +505,8 @@ export class SkyController {
     starAlpha: number;
     sunLightIntensity: number;
     ambientIntensity: number;
+    moonLightIntensity: number;
+    meshesEnabled: boolean;
   } {
     return {
       sunVisible: !!this.sunMesh?.isVisible,
@@ -415,6 +515,144 @@ export class SkyController {
       starAlpha: this.starMats.length ? this.starMats[0].alpha : 0,
       sunLightIntensity: this.sunLight?.intensity ?? 0,
       ambientIntensity: this.ambientLight?.intensity ?? 0,
+      moonLightIntensity: this.moonLight?.intensity ?? 0,
+      meshesEnabled: this.meshesEnabled,
+    };
+  }
+
+  /**
+   * Rich celestial debug snapshot for window.__fpDebug().sky. Includes mesh
+   * names, enabled/isVisible state, absolute + screen positions, sky radius,
+   * camera info, material fog flags, rendering group / layer mask, and the
+   * active sky/fog color + source (passed in by the adapter).
+   */
+  public getSkyDebug(opts: {
+    activeSkyColor: string;
+    skyColorSource: string;
+    activeFogColor: string;
+    fogColorSource: string;
+    modSkyOverlayActive: boolean;
+  }): Record<string, unknown> {
+    const cam = this.scene.activeCamera;
+    const viewport = this.scene.activeCamera?.viewport;
+    const engine = this.scene.getEngine();
+    const renderWidth = engine.getRenderWidth();
+    const renderHeight = engine.getRenderHeight();
+
+    const toScreen = (worldPos: BABYLON.Vector3 | null): { x: number; y: number; onScreen: boolean } | null => {
+      if (!cam || !worldPos) return null;
+      try {
+        // Babylon 6: Vector3.Project(vector, world, transform, viewport) where
+        // transform = viewMatrix * projectionMatrix.
+        const transform = cam.getViewMatrix().multiply(cam.getProjectionMatrix());
+        const projected = BABYLON.Vector3.Project(
+          worldPos,
+          BABYLON.Matrix.Identity(),
+          transform,
+          viewport ?? new BABYLON.Viewport(0, 0, renderWidth, renderHeight)
+        );
+        return {
+          x: Math.round(projected.x),
+          y: Math.round(projected.y),
+          onScreen: projected.x >= 0 && projected.x <= renderWidth && projected.y >= 0 && projected.y <= renderHeight && projected.z < 1,
+        };
+      } catch {
+        return null;
+      }
+    };
+
+    const camPos = cam ? cam.position : null;
+    const camTarget = cam ? (cam as any).target : null;
+    const camDir = cam && camTarget
+      ? [camTarget.x - cam.position.x, camTarget.y - cam.position.y, camTarget.z - cam.position.z]
+      : cam
+      ? [(cam as any).getForwardRay?.()?.direction?.x ?? 0, (cam as any).getForwardRay?.()?.direction?.y ?? 0, (cam as any).getForwardRay?.()?.direction?.z ?? 0]
+      : null;
+
+    const sunWorld = this.sunMesh ? this.sunMesh.getAbsolutePosition() : null;
+    const moonWorld = this.moonMesh ? this.moonMesh.getAbsolutePosition() : null;
+
+    // First 10 stars' screen positions + count of currently-visible stars.
+    const starScreen: Array<{ i: number; x: number; y: number; onScreen: boolean }> = [];
+    let visibleStarCount = 0;
+    for (let i = 0; i < Math.min(10, this.stars.length); i++) {
+      const s = this.stars[i];
+      if (!s) continue;
+      const w = s.getAbsolutePosition();
+      const sp = toScreen(w);
+      if (sp) starScreen.push({ i, ...sp });
+      if (s.isEnabled() && s.isVisible && (this.starMats[i]?.alpha ?? 0) > 0.05) visibleStarCount++;
+    }
+    for (let i = 10; i < this.stars.length; i++) {
+      const s = this.stars[i];
+      if (s && s.isEnabled() && s.isVisible && (this.starMats[i]?.alpha ?? 0) > 0.05) visibleStarCount++;
+    }
+
+    return {
+      skyRoot: {
+        name: this.skyRoot?.name ?? null,
+        enabled: this.skyRoot?.isEnabled() ?? false,
+        position: this.skyRoot ? [this.skyRoot.position.x, this.skyRoot.position.y, this.skyRoot.position.z] : null,
+      },
+      meshesEnabled: this.meshesEnabled,
+      sun: this.sunMesh
+        ? {
+            meshName: this.sunMesh.name,
+            enabled: this.sunMesh.isEnabled(),
+            isVisible: this.sunMesh.isVisible,
+            absolutePosition: sunWorld ? [sunWorld.x, sunWorld.y, sunWorld.z] : null,
+            screenPosition: toScreen(sunWorld),
+            renderingGroupId: this.sunMesh.renderingGroupId,
+            layerMask: this.sunMesh.layerMask,
+            materialFogEnabled: this.sunMat?.fogEnabled ?? null,
+            materialDisableLighting: this.sunMat?.disableLighting ?? null,
+          }
+        : null,
+      moon: this.moonMesh
+        ? {
+            meshName: this.moonMesh.name,
+            enabled: this.moonMesh.isEnabled(),
+            isVisible: this.moonMesh.isVisible,
+            absolutePosition: moonWorld ? [moonWorld.x, moonWorld.y, moonWorld.z] : null,
+            screenPosition: toScreen(moonWorld),
+            renderingGroupId: this.moonMesh.renderingGroupId,
+            layerMask: this.moonMesh.layerMask,
+            materialFogEnabled: this.moonMat?.fogEnabled ?? null,
+            materialDisableLighting: this.moonMat?.disableLighting ?? null,
+          }
+        : null,
+      stars: {
+        count: this.stars.length,
+        visibleCount: visibleStarCount,
+        first10ScreenPositions: starScreen,
+        materialFogEnabled: this.starMats[0]?.fogEnabled ?? null,
+        materialDisableLighting: this.starMats[0]?.disableLighting ?? null,
+        renderingGroupId: this.stars[0]?.renderingGroupId ?? null,
+      },
+      clouds: {
+        count: this.clouds.length,
+        renderingGroupId: this.clouds[0]?.renderingGroupId ?? null,
+      },
+      skyRadius: this.radius,
+      camera: cam
+        ? {
+            position: camPos ? [camPos.x, camPos.y, camPos.z] : null,
+            direction: camDir,
+            maxZ: cam.maxZ,
+            minZ: cam.minZ,
+            layerMask: cam.layerMask,
+          }
+        : null,
+      activeSkyColor: opts.activeSkyColor,
+      skyColorSource: opts.skyColorSource,
+      activeFogColor: opts.activeFogColor,
+      fogColorSource: opts.fogColorSource,
+      modSkyOverlayActive: opts.modSkyOverlayActive,
+      lights: {
+        sunIntensity: this.sunLight?.intensity ?? 0,
+        ambientIntensity: this.ambientLight?.intensity ?? 0,
+        moonIntensity: this.moonLight?.intensity ?? 0,
+      },
     };
   }
 
@@ -458,6 +696,7 @@ export class SkyController {
       this.moonMat?.dispose();
       this.sunLight?.dispose();
       this.ambientLight?.dispose();
+      this.moonLight?.dispose();
       this.skyRoot?.dispose();
     } catch {
       /* ignore */

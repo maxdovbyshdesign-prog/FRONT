@@ -157,12 +157,18 @@ export class WorldLightManager {
     if (this.frame % 6 === 1 || this.sortedScratch.length !== this.registry.size) {
       this.sortedScratch = Array.from(this.registry.values());
       this.sortedScratch.sort((a, b) => {
-        // Higher priority first.
-        if (b.priority !== a.priority) return b.priority - a.priority;
-        // Then nearer first.
+        // Proximity-aware scoring: a light's effective "rank distance" is its
+        // real distance MINUS (priority * 3). This means a nearby placed lamp
+        // (e.g. dist 3, pri 5 → score -12) beats a far mission artifact (dist
+        // 30, pri 10 → score 0), so the player's immediate surroundings are
+        // always lit by dynamic lights. High-priority lights still win when
+        // close (artifact at dist 5, pri 10 → score -25). Far lights that lose
+        // the budget still glow via their emissiveColor + GlowLayer.
         const da = distSq(a, px, py, pz);
         const db = distSq(b, px, py, pz);
-        return da - db;
+        const scoreA = Math.sqrt(da) - a.priority * 3;
+        const scoreB = Math.sqrt(db) - b.priority * 3;
+        return scoreA - scoreB;
       });
     }
 
@@ -290,7 +296,10 @@ export class WorldLightManager {
       blockName: string;
       intensity: number;
       range: number;
+      color: [number, number, number];
+      priority: number;
       active: boolean;
+      enabled: boolean;
       distance: number;
     }>;
   } {
@@ -304,7 +313,10 @@ export class WorldLightManager {
       blockName: e.blockDef.name,
       intensity: e.baseIntensity,
       range: this.scaleRange(e.profile.range),
+      color: (e.profile.color || [1, 1, 1]) as [number, number, number],
+      priority: e.priority,
       active: !!e.light,
+      enabled: e.light ? e.light.isEnabled() : false,
       distance: Math.sqrt(distSq(e, px, py, pz)),
     }));
     all.sort((a, b) => a.distance - b.distance);
@@ -329,6 +341,11 @@ export class WorldLightManager {
       if (e.light) n++;
     });
     return n;
+  }
+
+  /** The actual runtime budget (may differ from adapter.graphicsSettings after setBudget). */
+  public getBudget(): number {
+    return this.settings.maxActiveDynamicLights;
   }
 
   /**

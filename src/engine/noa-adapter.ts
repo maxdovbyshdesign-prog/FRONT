@@ -152,6 +152,8 @@ export class NoaEngineAdapter {
   private terrainDebugMat: BABYLON.StandardMaterial | null = null;
   /** Original chunk materials (saved when debug material is forced). */
   private savedChunkMaterials: Map<string, BABYLON.Material | null> = new Map();
+  /** Tracks the currently-applied terrain material mode to avoid per-frame re-application. */
+  private currentTerrainMaterialMode: "default" | "custom" | "debug" = "default";
   /** Live-tunable visual parameters (F3 debug console). */
   private visualTuning: VisualTuning = loadVisualTuning();
 
@@ -161,6 +163,41 @@ export class NoaEngineAdapter {
   private worldLightManager: WorldLightManager | null = null;
   private skyController: SkyController | null = null;
   private graphicsSettings: GraphicsSettings;
+
+  // ---- Debug source tracking (sky/fog color provenance) ----
+  /** Human-readable source of the currently-applied sky/clear color. */
+  private skyColorSource: string = "built-in preset";
+  /** Human-readable source of the currently-applied fog color. */
+  private fogColorSource: string = "built-in preset";
+  /** Active sky (clear) color as a hex string, for F3 readback. */
+  private activeSkyColorHex: string = "#000000";
+  /** Active fog color as a hex string, for F3 readback. */
+  private activeFogColorHex: string = "#000000";
+  /** Whether the mod sky overlay is currently applied to the scene. */
+  private modSkyOverlayActive: boolean = false;
+  /** Current lighting phase label (dawn/day/dusk/night). */
+  private lightingPhase: string = "day";
+
+  // ---- Test-mode flags (Full Dark / Noon / Lamp Only) ----
+  /** When true, applyAtmosphereForCurrentPhase forces near-zero lighting. */
+  private fullDarkTestActive: boolean = false;
+  /** When true, forces bright noon lighting regardless of time-of-day. */
+  private noonLightingTestActive: boolean = false;
+  /** When true, disables fog/glow/bloom + near-zero ambient/sun/moon, dynamic lights on. */
+  private lampOnlyTestActive: boolean = false;
+
+  // ---- Chunk + FPS diagnostics ----
+  private chunkGenCount: number = 0;
+  private chunkGenTotalMs: number = 0;
+  private chunkGenMaxMs: number = 0;
+  private chunksThisWindow: number = 0;
+  private lastChunksPerSecTime: number = Date.now();
+  private chunksPerSec: number = 0;
+  private pendingChunkRequests: number = 0;
+  private frameCount: number = 0;
+  private fps: number = 0;
+  private lastFpsTime: number = performance.now();
+  private lastFpsFrameCount: number = 0;
 
   constructor(
     container: HTMLElement,
@@ -239,7 +276,27 @@ export class NoaEngineAdapter {
     // lamps, and the artifact) so the player sees a live world on boot.
     this.setupPreviewCamera();
 
+    // 8. Sync the mod sky overlay toggle (default OFF) so the legacy
+    // example-ruins-pack/sky/sky.json purple overlay does NOT silently
+    // dominate the built-in visual presets at boot.
+    this.syncModSkyOverlay();
+
     console.log('[NoaEngineAdapter] Standalone 3D voxel engine fully synchronized.');
+  }
+
+  /**
+   * Keep ModRegistry's mod-sky-overlay enable flag in sync with the VisualTuning
+   * `useModSkyOverlay` toggle. This is the single source of truth: the overlay
+   * is applied to the scene ONLY when both vt.useModSkyOverlay is true AND a mod
+   * has registered sky values. Default is OFF.
+   */
+  private syncModSkyOverlay(): void {
+    const reg = ModRegistry.getInstance();
+    const desired = this.visualTuning.useModSkyOverlay && reg.hasModSkyOverlay();
+    if (reg.isModSkyOverlayEnabled() !== desired) {
+      reg.setModSkyOverlayEnabled(desired);
+    }
+    this.modSkyOverlayActive = desired && reg.hasModSkyOverlay();
   }
 
   /**
@@ -259,25 +316,31 @@ export class NoaEngineAdapter {
     try {
       const cam = (this.noa as any).camera;
       if (!cam) return;
-      // Sun orbital position at timeOfDay:
+      // Sun orbital position at timeOfDay matches SkyController:
       //   angle = timeOfDay * 2π
-      //   sunDir = (cos(angle), sin(angle), 0.5)  [matches SkyController]
-      // The sun's horizontal direction from the player is (cos, 0, 0.5/z-normalized).
-      // noa camera heading: 0 = +Z, π/2 = +X, π = -Z, 3π/2 = -X.
-      // heading = atan2(sunDirX, sunDirZ) faces the sun.
+      //   sunPos = (cos(angle)*r, sin(angle)*r, r*0.5)
+      // We point the camera at the sun so the celestial body is ON-SCREEN at
+      // boot (the old fixed downward pitch hid the high sun behind the top of
+      // the viewport). A reduced pitch keeps terrain visible in the lower frame.
       const angle = this.timeOfDay * Math.PI * 2;
       const sunDirX = Math.cos(angle);
+      const sunDirY = Math.sin(angle);
       const sunDirZ = 0.5; // matches SkyController's +z*0.5 bias
       let heading = Math.atan2(sunDirX, sunDirZ);
       if (heading < 0) heading += Math.PI * 2;
       cam.heading = heading;
-      // Slight DOWNWARD pitch so terrain is visible in the lower half of the
-      // frame. noa applies pitch as holder.rotation.x; in Babylon a positive
-      // rotation.x on a +Z-facing camera tilts it downward. We use a small
-      // positive value so the player sees ground, not sky.
-      cam.pitch = 0.12;
+      // Sun elevation angle above the horizon (radians).
+      const horiz = Math.sqrt(sunDirX * sunDirX + sunDirZ * sunDirZ);
+      const sunElevation = Math.atan2(sunDirY, horiz);
+      // Aim the camera halfway between the horizon and the sun so BOTH the sun
+      // (upper frame) and terrain (lower frame) are visible. noa's pitch is
+      // applied as holder.rotation.x: POSITIVE = look DOWN, NEGATIVE = look UP.
+      // The sun is up, so we use a negative (upward) pitch, scaled to half the
+      // sun's elevation so terrain isn't lost.
+      const pitch = -sunElevation * 0.55;
+      cam.pitch = Math.max(-0.9, Math.min(0.3, pitch));
       console.log(
-        `[NoaEngineAdapter] Preview camera set: heading=${(heading * 180 / Math.PI).toFixed(0)}°, pitch=${cam.pitch.toFixed(2)} rad (facing sun at timeOfDay=${this.timeOfDay.toFixed(3)}).`
+        `[NoaEngineAdapter] Preview camera set: heading=${(heading * 180 / Math.PI).toFixed(0)}°, pitch=${cam.pitch.toFixed(2)} rad (aiming at sun, timeOfDay=${this.timeOfDay.toFixed(3)}).`
       );
     } catch (e) {
       console.warn('[NoaEngineAdapter] Preview camera setup failed:', e);
@@ -309,7 +372,10 @@ export class NoaEngineAdapter {
       scene,
       this.noa.registry,
       maxLights,
-      this.noa.rendering ?? null
+      this.noa.rendering ?? null,
+      undefined, // safeMaterialsMode (reads ?safeMaterials=1)
+      undefined, // customTerrainMaterialsMode (reads ?customTerrainMaterials=1)
+      this.visualTuning.litTerrainMaterials
     );
     this.materialService.registerAll(this.blockService.getBlockDefinitions());
   }
@@ -336,7 +402,15 @@ export class NoaEngineAdapter {
     );
 
     // Sky + celestial bodies + sun/ambient lights.
-    this.skyController = new SkyController(scene, this.graphicsSettings);
+    // Pass an octree-registration callback so sky meshes are added to noa's
+    // octree dynamicContent — without this, noa's OctreeSceneComponent excludes
+    // them from active-mesh candidates and they NEVER RENDER.
+    this.skyController = new SkyController(scene, this.graphicsSettings, (mesh) => {
+      const octMgr = (this.noa.rendering as any)?._octreeManager;
+      if (octMgr && typeof octMgr.addMesh === "function") {
+        octMgr.addMesh(mesh, false);
+      }
+    });
 
     // World light registry. Pre-seed static + generated lights from WorldService.
     this.worldLightManager = new WorldLightManager(scene, this.graphicsSettings);
@@ -372,7 +446,7 @@ export class NoaEngineAdapter {
       const cam = scene?.activeCamera;
       const sunMesh = scene?.getMeshByName("fp_sun");
       const moonMesh = scene?.getMeshByName("fp_moon");
-      return {
+      const snapshot = {
         quality: adapter.graphicsSettings.quality,
         timeOfDay: adapter.timeOfDay,
         renderDistanceBlocks: rdb,
@@ -477,14 +551,42 @@ export class NoaEngineAdapter {
           adapter.setTimeOfDay(t);
           return adapter.timeOfDay;
         },
-        /** Toggle sky mesh visibility for QA (isolates sky occlusion issues). */
+        /**
+         * MASTER sky-mesh toggle ("Sky Off / Sky On"). Now PERSISTS — it flips
+         * SkyController.setMeshesEnabled(), which setVisibilityOverrides()
+         * respects every frame. Previously this called a one-shot setVisible()
+         * that was immediately re-enabled next frame, so the buttons appeared
+         * to do nothing.
+         */
         setSkyVisible(visible: boolean) {
           if (adapter.skyController) {
-            adapter.skyController.setVisible(visible);
+            adapter.skyController.setMeshesEnabled(visible);
             return visible;
           }
           return null;
         },
+        /** Granular per-body enable (sun/moon/stars/clouds) via VisualTuning. */
+        setSkyBodyVisible(body: "sun" | "moon" | "stars" | "clouds", visible: boolean) {
+          const key = body === "sun" ? "sunVisible"
+            : body === "moon" ? "moonVisible"
+            : body === "stars" ? "starsVisible"
+            : "cloudsVisible";
+          adapter.updateVisualTuning({ [key]: visible });
+          return visible;
+        },
+        /** Toggle the legacy mod sky overlay (opt-in, default OFF). */
+        setModSkyOverlay(enabled: boolean) {
+          adapter.setModSkyOverlay(enabled);
+          return adapter.modSkyOverlayActive;
+        },
+        /** Full Dark lighting test (ambient/sun/moon → 0). */
+        fullDarkTest() { adapter.fullDarkTest(); },
+        /** Noon lighting test (bright day). */
+        noonLightingTest() { adapter.noonLightingTest(); },
+        /** Lamp Only test (fog/glow/bloom off, ambient/sun/moon → 0, lights on). */
+        lampOnlyTest() { adapter.lampOnlyTest(); },
+        /** Clear all lighting test modes. */
+        clearLightingTests() { adapter.clearLightingTests(); },
         /** Toggle fog on/off for QA. */
         setFogEnabled(enabled: boolean) {
           const sc = adapter.getSceneSafe();
@@ -599,18 +701,166 @@ export class NoaEngineAdapter {
         importVisualSettings(settings: any) {
           return adapter.importVisualSettings(settings);
         },
-        /** Isolate sky (hide terrain + world lights, show only sky). */
+        /**
+         * Isolate sky — hide terrain + world lights, disable fog, set a dark
+         * readable clearColor (NOT purple), ensure sky meshes are on, and point
+         * the camera at the sun/moon so bodies are on-screen. Pass false to
+         * restore. Delegates to the adapter method.
+         */
         isolateSky(isolated: boolean) {
-          const sc = adapter.getSceneSafe();
-          if (!sc) return;
-          sc.meshes.forEach((m: any) => {
-            if (m.name.startsWith("chunk_") || m.name.startsWith("wl-")) {
-              m.setEnabled(!isolated);
+          adapter.isolateSky(isolated);
+        },
+        /** Apply pending chunk distances (requires renderer restart). Best-effort. */
+        applyChunkDistances(add: number, remove: number) {
+          try {
+            const worldAny = (adapter as any).noa?.world as any;
+            if (worldAny) {
+              if (typeof worldAny.setChunkAddDistance === 'function') worldAny.setChunkAddDistance(add);
+              if (typeof worldAny.setChunkRemoveDistance === 'function') worldAny.setChunkRemoveDistance(remove);
             }
-          });
-          console.log(`[NoaEngineAdapter] Sky ${isolated ? "isolated" : "restored"}.`);
+          } catch { /* noa may not support live changes */ }
+          adapter.updateVisualTuning({ pendingChunkAddDistance: add, pendingChunkRemoveDistance: remove });
+          console.warn('[NoaEngineAdapter] Chunk distance changes usually require a renderer restart to fully apply.');
         },
       };
+
+      // ---- Rich debug snapshots (computed lazily on property access) ----
+      Object.defineProperty(snapshot, 'sky', {
+        get() {
+          if (!adapter.skyController) return null;
+          return adapter.skyController.getSkyDebug({
+            activeSkyColor: adapter.activeSkyColorHex,
+            skyColorSource: adapter.skyColorSource,
+            activeFogColor: adapter.activeFogColorHex,
+            fogColorSource: adapter.fogColorSource,
+            modSkyOverlayActive: adapter.modSkyOverlayActive,
+          });
+        },
+        configurable: true,
+      });
+      Object.defineProperty(snapshot, 'lights', {
+        get() {
+          const scene = adapter.getSceneSafe();
+          const playerPos = adapter.getPlayerPositionSafe() || [0, 15, 0];
+          const base = adapter.worldLightManager
+            ? adapter.worldLightManager.getDebugInfo(playerPos, 8)
+            : { registered: 0, active: 0, nearest: [] };
+          // Probe a sample chunk material's maxSimultaneousLights.
+          let terrainMaxLights: number | null = null;
+          let terrainDisableLighting: boolean | null = null;
+          let terrainEmissiveZero: boolean | null = null;
+          if (scene) {
+            const chunk = scene.meshes.find((m: any) => m.name.startsWith("chunk_") && m.material);
+            if (chunk && chunk.material) {
+              const mat = chunk.material as BABYLON.StandardMaterial;
+              terrainMaxLights = (mat as any).maxSimultaneousLights ?? null;
+              terrainDisableLighting = (mat as any).disableLighting ?? null;
+              const em = (mat as any).emissiveColor;
+              terrainEmissiveZero = em ? (em.r === 0 && em.g === 0 && em.b === 0) : null;
+            }
+          }
+          const budget = adapter.worldLightManager ? adapter.worldLightManager.getBudget() : adapter.graphicsSettings.maxActiveDynamicLights;
+          // Is the nearest placed light being limited by the budget?
+          let budgetLimitingNearest = false;
+          if (base.nearest && base.nearest.length) {
+            // If there are more registered lights than budget, any non-active
+            // nearest light is being culled by the budget.
+            budgetLimitingNearest = base.registered > budget && base.nearest.some((n: any) => !n.active);
+          }
+          return {
+            ...base,
+            activeBudget: budget,
+            dynamicLightsEnabled: adapter.visualTuning.dynamicLightsEnabled,
+            terrainMaterialMaxSimultaneousLights: terrainMaxLights,
+            terrainMaterialDisableLighting: terrainDisableLighting,
+            terrainMaterialEmissiveZero: terrainEmissiveZero,
+            budgetLimitingNearest,
+          };
+        },
+        configurable: true,
+      });
+      Object.defineProperty(snapshot, 'lighting', {
+        get() {
+          const scene = adapter.getSceneSafe();
+          const amb = scene ? scene.ambientColor : null;
+          const sunLight = adapter.skyController?.getSunLight();
+          const ambient = adapter.skyController?.getAmbientLight();
+          const moon = adapter.skyController?.getMoonLight();
+          return {
+            timeOfDay: adapter.timeOfDay,
+            phase: adapter.lightingPhase,
+            sceneAmbientColor: amb ? [amb.r, amb.g, amb.b] : null,
+            hemisphericIntensity: ambient?.intensity ?? 0,
+            sunIntensity: sunLight?.intensity ?? 0,
+            sunDiffuse: sunLight?.diffuse ? [sunLight.diffuse.r, sunLight.diffuse.g, sunLight.diffuse.b] : null,
+            moonIntensity: moon?.intensity ?? 0,
+            moonDiffuse: moon?.diffuse ? [moon.diffuse.r, moon.diffuse.g, moon.diffuse.b] : null,
+            fullDarkTestActive: adapter.fullDarkTestActive,
+            noonLightingTestActive: adapter.noonLightingTestActive,
+            lampOnlyTestActive: adapter.lampOnlyTestActive,
+            requested: {
+              daySceneAmbient: adapter.visualTuning.daySceneAmbient,
+              nightSceneAmbient: adapter.visualTuning.nightSceneAmbient,
+              sceneAmbientMultiplier: adapter.visualTuning.sceneAmbientMultiplier,
+              ambientIntensityMultiplier: adapter.visualTuning.ambientIntensityMultiplier,
+              sunIntensityMultiplier: adapter.visualTuning.sunIntensityMultiplier,
+              noonSunIntensity: adapter.visualTuning.noonSunIntensity,
+              midnightSunIntensity: adapter.visualTuning.midnightSunIntensity,
+              moonLightEnabled: adapter.visualTuning.moonLightEnabled,
+              moonLightIntensity: adapter.visualTuning.moonLightIntensity,
+            },
+          };
+        },
+        configurable: true,
+      });
+      Object.defineProperty(snapshot, 'modSky', {
+        get() {
+          const reg = ModRegistry.getInstance();
+          return {
+            overlayActive: adapter.modSkyOverlayActive,
+            useModSkyOverlay: adapter.visualTuning.useModSkyOverlay,
+            registered: reg.hasModSkyOverlay(),
+            enabled: reg.isModSkyOverlayEnabled(),
+            config: reg.getActiveSky(),
+            sources: reg.getActiveSkySources(),
+            skyColorSource: adapter.skyColorSource,
+            fogColorSource: adapter.fogColorSource,
+            activeSkyColorHex: adapter.activeSkyColorHex,
+            activeFogColorHex: adapter.activeFogColorHex,
+          };
+        },
+        configurable: true,
+      });
+      Object.defineProperty(snapshot, 'chunks', {
+        get() {
+          const scene = adapter.getSceneSafe();
+          const meshCount = scene ? scene.meshes.filter((m: any) => m.name.startsWith("chunk_")).length : 0;
+          const avg = adapter.chunkGenCount > 0 ? adapter.chunkGenTotalMs / adapter.chunkGenCount : 0;
+          return {
+            chunkAddDistance: adapter.chunkAddDistance,
+            chunkRemoveDistance: adapter.chunkRemoveDistance,
+            pendingChunkAddDistance: adapter.visualTuning.pendingChunkAddDistance,
+            pendingChunkRemoveDistance: adapter.visualTuning.pendingChunkRemoveDistance,
+            blockDataNeededEmitInterval: BLOCK_DATA_NEEDED_EMIT_INTERVAL,
+            renderDistanceBlocks: adapter.getRenderDistanceBlocks(),
+            loadedChunkCount: meshCount,
+            totalGenerated: adapter.chunkGenCount,
+            avgGenMs: Number(avg.toFixed(2)),
+            maxGenMs: Number(adapter.chunkGenMaxMs.toFixed(2)),
+            chunksPerSec: adapter.chunksPerSec,
+            fps: adapter.fps,
+            fogMatchRenderDistance: adapter.visualTuning.fogMatchRenderDistance,
+            showChunkBoundaries: adapter.visualTuning.showChunkBoundaries,
+          };
+        },
+        configurable: true,
+      });
+      Object.defineProperty(snapshot, 'fps', {
+        get() { return adapter.fps; },
+        configurable: true,
+      });
+
+      return snapshot;
     };
 
     // Debug keyboard shortcuts for time of day (F6=dawn, F7=noon, F8=dusk, F9=midnight).
@@ -664,6 +914,20 @@ export class NoaEngineAdapter {
     if (patch.activeLightBudget !== undefined && this.worldLightManager) {
       this.worldLightManager.setBudget(patch.activeLightBudget);
     }
+    // Sync the mod sky overlay toggle whenever it changes.
+    if (patch.useModSkyOverlay !== undefined) {
+      this.syncModSkyOverlay();
+    }
+    // Propagate moon-light config to the sky controller.
+    if (this.skyController && (
+      patch.moonLightEnabled !== undefined ||
+      patch.moonLightIntensity !== undefined
+    )) {
+      this.skyController.setMoonLight({
+        enabled: this.visualTuning.moonLightEnabled,
+        intensity: this.visualTuning.moonLightIntensity,
+      });
+    }
     return this.getVisualTuning();
   }
 
@@ -686,6 +950,18 @@ export class NoaEngineAdapter {
       if (preset.activeLightBudget !== undefined && this.worldLightManager) {
         this.worldLightManager.setBudget(preset.activeLightBudget);
       }
+      // Clear any active test modes when applying a preset.
+      this.fullDarkTestActive = false;
+      this.noonLightingTestActive = false;
+      this.lampOnlyTestActive = false;
+      // Sync mod overlay (presets set useModSkyOverlay:false so the legacy
+      // purple overlay never silently re-enables).
+      this.syncModSkyOverlay();
+      // Propagate moon-light config.
+      this.skyController?.setMoonLight({
+        enabled: this.visualTuning.moonLightEnabled,
+        intensity: this.visualTuning.moonLightIntensity,
+      });
       console.log(`[NoaEngineAdapter] Applied preset: ${name}`);
     }
     return this.getVisualTuning();
@@ -713,7 +989,180 @@ export class NoaEngineAdapter {
     if (settings && typeof settings === "object") {
       this.visualTuning = { ...DEFAULT_VISUAL_TUNING, ...settings };
     }
+    this.syncModSkyOverlay();
+    this.skyController?.setMoonLight({
+      enabled: this.visualTuning.moonLightEnabled,
+      intensity: this.visualTuning.moonLightIntensity,
+    });
     return this.getVisualTuning();
+  }
+
+  // ---- Lighting test modes (F3 QA buttons) ----
+
+  /**
+   * FULL DARK TEST: ambient near zero, hemi=0, sun=0, moon=0. Normal terrain
+   * MUST become genuinely dark. If it doesn't, the terrain material is unlit /
+   * fullbright / emissive and must be fixed (disableLighting=false,
+   * emissiveColor=0). Clears other test modes.
+   */
+  public fullDarkTest(): void {
+    this.fullDarkTestActive = true;
+    this.noonLightingTestActive = false;
+    this.lampOnlyTestActive = false;
+    console.log("[NoaEngineAdapter] FULL DARK TEST active — terrain should be dark.");
+  }
+
+  /**
+   * NOON LIGHTING TEST: restore bright day lighting (ambient + sun at day
+   * values) regardless of time-of-day. Terrain should be bright.
+   */
+  public noonLightingTest(): void {
+    this.fullDarkTestActive = false;
+    this.noonLightingTestActive = true;
+    this.lampOnlyTestActive = false;
+    console.log("[NoaEngineAdapter] NOON LIGHTING TEST active — terrain should be bright.");
+  }
+
+  /**
+   * LAMP ONLY TEST: fog off, glow off, bloom off, ambient/sun/moon near zero,
+   * dynamic lights ENABLED. Place a yellow (halogen, id 7) or cyan (wall lamp,
+   * id 6) block — nearby terrain MUST receive colored illumination. Destroying
+   * the block removes the light. This proves PointLights actually light terrain
+   * (GlowLayer/emissive are NOT lighting).
+   */
+  public lampOnlyTest(): void {
+    this.fullDarkTestActive = false;
+    this.noonLightingTestActive = false;
+    this.lampOnlyTestActive = true;
+    // Ensure dynamic lights are on for this test, and boost the budget so the
+    // nearest placed lamp actually activates (the proximity-aware sort favors
+    // nearby lights, and a higher budget guarantees the test lamp isn't culled
+    // by far mission artifacts).
+    this.visualTuning.dynamicLightsEnabled = true;
+    this.visualTuning.activeLightBudget = Math.max(8, this.visualTuning.activeLightBudget);
+    this.worldLightManager?.setBudget(this.visualTuning.activeLightBudget);
+    console.log("[NoaEngineAdapter] LAMP ONLY TEST active — place lamps to verify dynamic lighting.");
+  }
+
+  /** Clear all lighting test modes (return to normal day/night). */
+  public clearLightingTests(): void {
+    this.fullDarkTestActive = false;
+    this.noonLightingTestActive = false;
+    this.lampOnlyTestActive = false;
+    console.log("[NoaEngineAdapter] Lighting test modes cleared.");
+  }
+
+  /** Toggle the mod sky overlay at runtime (F3). */
+  public setModSkyOverlay(enabled: boolean): void {
+    this.visualTuning.useModSkyOverlay = !!enabled;
+    this.syncModSkyOverlay();
+  }
+
+  /**
+   * ISOLATE SKY: hide terrain + world lights so only the celestial bodies
+   * remain. Unlike the old version (which left the purple mod-overlay
+   * clearColor), this:
+   *   - sets a sticky `skyIsolated` flag that applyAtmosphereForCurrentPhase()
+   *     respects (so the per-frame fog/clearColor apply does NOT overwrite the
+   *     isolate state)
+   *   - disables fog (so no haze hides the bodies)
+   *   - forces a dark, readable clearColor (not purple)
+   *   - ensures sky meshes are master-enabled
+   *   - repositions the camera to look toward the sun (so bodies are on-screen)
+   * Pass false to restore the scene.
+   */
+  public isolateSky(isolated: boolean): void {
+    const scene = this.getSceneSafe();
+    if (!scene) return;
+    this.skyIsolated = isolated;
+    if (isolated) {
+      // Stash current fog/clear state so we can restore.
+      this._preIsolateFogEnabled = scene.fogEnabled;
+      this._preIsolateClearColor = scene.clearColor ? scene.clearColor.clone() : null;
+      this._preIsolateSkyMeshesEnabled = this.skyController?.isMeshesEnabled() ?? true;
+
+      scene.meshes.forEach((m: any) => {
+        if (m.name.startsWith("chunk_") || m.name.startsWith("wl-")) {
+          m.setEnabled(false);
+        }
+      });
+      scene.fogEnabled = false;
+      // Dark navy, NOT purple — clearly readable for celestial bodies.
+      scene.clearColor = new BABYLON.Color4(0.01, 0.01, 0.03, 1.0);
+      this.skyController?.setMeshesEnabled(true);
+
+      // Reposition camera to look at the sun so bodies are on-screen.
+      this.pointCameraAtSun();
+      console.log("[NoaEngineAdapter] Sky isolated — terrain/lights hidden, camera pointed at sun.");
+    } else {
+      scene.meshes.forEach((m: any) => {
+        if (m.name.startsWith("chunk_") || m.name.startsWith("wl-")) {
+          m.setEnabled(true);
+        }
+      });
+      if (this._preIsolateFogEnabled !== null) scene.fogEnabled = this._preIsolateFogEnabled;
+      if (this._preIsolateClearColor) scene.clearColor = this._preIsolateClearColor;
+      if (this._preIsolateSkyMeshesEnabled !== null) {
+        this.skyController?.setMeshesEnabled(this._preIsolateSkyMeshesEnabled);
+      }
+      console.log("[NoaEngineAdapter] Sky restored — terrain/lights re-enabled.");
+    }
+  }
+
+  /** Sticky flag: when true, applyAtmosphereForCurrentPhase skips fog/clearColor. */
+  private skyIsolated: boolean = false;
+
+  private _preIsolateFogEnabled: boolean | null = null;
+  private _preIsolateClearColor: BABYLON.Color4 | null = null;
+  private _preIsolateSkyMeshesEnabled: boolean | null = null;
+
+  /**
+   * Point the noa/Babylon camera toward the current sun (or moon) position so
+   * celestial bodies are CENTERED on-screen (used by Isolate Sky). Does NOT
+   * request pointer lock. noa applies cam.heading/pitch to the camera holder
+   * every render frame, and these persist when pointer lock is not active.
+   *
+   * Convention (from noa-engine camera.js):
+   *   - heading 0 = +Z, heading π/2 = +X (yaw around Y)
+   *   - pitch: POSITIVE = look DOWN, NEGATIVE = look UP (rotateX)
+   * So to look UP at a sun above the horizon, pitch must be NEGATIVE.
+   */
+  private pointCameraAtSun(): void {
+    try {
+      const cam = (this.noa as any).camera;
+      const scene = this.getSceneSafe();
+      if (!cam || !scene) return;
+      const sunMesh = scene.getMeshByName("fp_sun");
+      const moonMesh = scene.getMeshByName("fp_moon");
+      // Prefer whichever body is currently visible.
+      const target = sunMesh && sunMesh.isEnabled() && sunMesh.isVisible
+        ? sunMesh
+        : moonMesh && moonMesh.isEnabled() && moonMesh.isVisible
+        ? moonMesh
+        : sunMesh ?? moonMesh ?? null;
+      if (!target) return;
+      const tpos = target.getAbsolutePosition();
+      // Camera world position = the holder position (camera is parented to it).
+      const holder = (this.noa as any).rendering?._cameraHolder;
+      const cpos = holder ? holder.position : (scene.activeCamera ? scene.activeCamera.position : null);
+      if (!cpos || !tpos) return;
+      const dx = tpos.x - cpos.x;
+      const dz = tpos.z - cpos.z;
+      const dy = tpos.y - cpos.y;
+      // heading = atan2(dx, dz) (0 = +Z, π/2 = +X)
+      let heading = Math.atan2(dx, dz);
+      if (heading < 0) heading += Math.PI * 2;
+      cam.heading = heading;
+      // pitch: NEGATIVE to look up. Center the body fully.
+      const horiz = Math.sqrt(dx * dx + dz * dz);
+      const elevation = Math.atan2(dy, horiz); // positive when sun is above
+      const pitch = -elevation; // negate so camera looks UP
+      // Clamp to noa's safe range (just under ±π/2).
+      cam.pitch = Math.max(-Math.PI / 2 + 0.05, Math.min(Math.PI / 2 - 0.05, pitch));
+      console.log(`[NoaEngineAdapter] Camera pointed at ${target.name} (heading=${(heading * 180 / Math.PI).toFixed(0)}°, pitch=${(cam.pitch * 180 / Math.PI).toFixed(0)}°).`);
+    } catch (e) {
+      console.warn("[NoaEngineAdapter] pointCameraAtSun failed:", e);
+    }
   }
 
   /**
@@ -751,6 +1200,7 @@ export class NoaEngineAdapter {
       this.savedChunkMaterials.clear();
       console.log("[NoaEngineAdapter] Terrain debug material OFF (originals restored).");
     }
+    this.currentTerrainMaterialMode = enabled ? "debug" : "default";
     return enabled;
   }
 
@@ -775,6 +1225,12 @@ export class NoaEngineAdapter {
       }
       this.noa.world.setChunkData(id, ndarray);
       const elapsed = performance.now() - start;
+
+      // Chunk diagnostics for F3: total count, avg/max gen time, chunks/sec.
+      this.chunkGenCount++;
+      this.chunkGenTotalMs += elapsed;
+      if (elapsed > this.chunkGenMaxMs) this.chunkGenMaxMs = elapsed;
+      this.chunksThisWindow++;
 
       if (ENABLE_PERF_LOGS) {
         this.chunkTimes.push(elapsed);
@@ -970,6 +1426,21 @@ export class NoaEngineAdapter {
       const dtMs = Math.min(250, now - this.lastFrameTime); // clamp huge spikes
       this.lastFrameTime = now;
 
+      // FPS + chunks-per-sec diagnostics for F3.
+      this.frameCount++;
+      const fpsElapsed = now - this.lastFpsTime;
+      if (fpsElapsed >= 500) {
+        this.fps = Math.round(((this.frameCount - this.lastFpsFrameCount) * 1000) / fpsElapsed);
+        this.lastFpsFrameCount = this.frameCount;
+        this.lastFpsTime = now;
+      }
+      const cpsNow = Date.now();
+      if (cpsNow - this.lastChunksPerSecTime >= 1000) {
+        this.chunksPerSec = this.chunksThisWindow;
+        this.chunksThisWindow = 0;
+        this.lastChunksPerSecTime = cpsNow;
+      }
+
       // Advance the master day/night clock (frame-rate independent).
       // Respect visual tuning: freeze time and speed multiplier.
       if (!this.visualTuning.timeFrozen) {
@@ -1046,12 +1517,20 @@ export class NoaEngineAdapter {
 
   /**
    * Resolve the visual preset for the current biome + sun altitude, merge any
-   * mod sky overlays, apply VisualTuning live overrides, and apply to the
-   * scene + pipeline.
+   * mod sky overlays (ONLY when explicitly enabled), apply VisualTuning live
+   * overrides, and apply to the scene + pipeline.
    *
-   * Pass 5: now applies real day/night brightness by scaling ambient + sun
-   * light intensities based on sun altitude. Previously only sky color
-   * changed, leaving terrain fullbright at night.
+   * SKY OVERLAY AUDIT (this pass):
+   *   - The mod sky overlay is now OPT-IN. It only applies when
+   *     `visualTuning.useModSkyOverlay` is true AND a mod has registered sky
+   *     values. The old code merged it every frame, letting the legacy
+   *     example-ruins-pack/sky/sky.json purple values silently dominate.
+   *   - skyColor / fogColor sources are tracked and exposed via
+   *     __fpDebug().sky for F3.
+   *   - scene.ambientColor is now driven by the day/night cycle (was a constant
+   *     0.5,0.5,0.5 — the root cause of "night never gets dark" and "lamps
+   *     don't illuminate terrain").
+   *   - Test modes (Full Dark / Noon / Lamp Only) override lighting for QA.
    */
   private applyAtmosphereForCurrentPhase(
     playerPos: [number, number, number],
@@ -1059,6 +1538,9 @@ export class NoaEngineAdapter {
   ): void {
     const scene = this.getSceneSafe();
     if (!scene) return;
+
+    // Keep the mod overlay flag in sync each frame (cheap).
+    this.syncModSkyOverlay();
 
     const [x, , z] = playerPos;
     const inBlackGlass = this.worldService.isBlackGlassZone(x, z);
@@ -1072,65 +1554,167 @@ export class NoaEngineAdapter {
       altitude = Math.sin(angle);
     }
 
+    // Lighting phase label for F3.
+    if (altitude > 0.15) this.lightingPhase = "day";
+    else if (altitude > -0.15) this.lightingPhase = altitude >= 0 ? "dusk" : "dawn";
+    else this.lightingPhase = "night";
+
+    const vt = this.visualTuning;
+
+    // ---- Resolve base preset (built-in) ----
     let preset = resolveBiomePhasePreset(biome, altitude);
-    preset = this.mergeModSkyOverlay(preset);
-    if (this.visualTuning.fogAutoClampToRenderDistance) {
+    let resolvedSkyColor = preset.skyColor;
+    let resolvedFogColor = preset.fogColor;
+    this.skyColorSource = "built-in preset";
+    this.fogColorSource = "built-in preset";
+
+    // ---- Mod sky overlay (OPT-IN) ----
+    // Only merge mod values when the toggle is on. This is the fix for the
+    // "purple void" — the legacy example-ruins-pack/sky/sky.json no longer
+    // silently overrides the built-in presets.
+    if (this.modSkyOverlayActive) {
+      const merged = this.mergeModSkyOverlay(preset);
+      const reg = ModRegistry.getInstance();
+      const sources = reg.getActiveSkySources();
+      if (merged.skyColor !== preset.skyColor) {
+        resolvedSkyColor = merged.skyColor;
+        this.skyColorSource = `mod overlay (${sources.skyColor ?? sources.dayColor ?? sources.nightColor ?? 'unknown'})`;
+      }
+      if (merged.fogColor !== preset.fogColor) {
+        resolvedFogColor = merged.fogColor;
+        this.fogColorSource = `mod overlay (${sources.fogColor ?? 'unknown'})`;
+      }
+      preset = merged;
+    }
+
+    if (vt.fogAutoClampToRenderDistance) {
       preset = clampPresetToRenderDistance(preset, this.getRenderDistanceBlocks());
     }
 
-    // ---- Apply VisualTuning fog overrides ----
-    const vt = this.visualTuning;
-    scene.fogEnabled = vt.fogEnabled;
-    scene.fogMode = BABYLON.Scene.FOGMODE_LINEAR;
-    scene.fogColor = vt.fogColorHex
-      ? parseHexColor3(vt.fogColorHex, new BABYLON.Color3(0.3, 0.2, 0.3))
-      : parseHexColor3(preset.fogColor, new BABYLON.Color3(0.3, 0.2, 0.3));
-    scene.clearColor = parseHexColor4(
-      preset.skyColor,
-      new BABYLON.Color4(0.05, 0.03, 0.08, 1.0)
-    );
-    scene.fogStart = vt.fogStart !== null ? vt.fogStart : preset.fogStart;
-    scene.fogEnd = vt.fogEnd !== null ? vt.fogEnd : preset.fogEnd;
-    // Safety: fogStart must be < fogEnd.
-    if (scene.fogStart >= scene.fogEnd) {
-      scene.fogStart = Math.max(20, scene.fogEnd - 40);
+    // ---- Fog + ClearColor ----
+    // When sky is isolated (Isolate Sky debug mode), SKIP the per-frame
+    // fog/clearColor apply so the isolate state (dark navy clearColor, fog off)
+    // persists. isolateSky() manages these directly.
+    if (!this.skyIsolated) {
+      scene.fogEnabled = vt.fogEnabled;
+      scene.fogMode = BABYLON.Scene.FOGMODE_LINEAR;
+      if (vt.fogColorHex) {
+        scene.fogColor = parseHexColor3(vt.fogColorHex, new BABYLON.Color3(0.3, 0.2, 0.3));
+        this.fogColorSource = "debug override";
+        this.activeFogColorHex = vt.fogColorHex;
+      } else {
+        scene.fogColor = parseHexColor3(resolvedFogColor, new BABYLON.Color3(0.3, 0.2, 0.3));
+        this.activeFogColorHex = resolvedFogColor;
+      }
+      scene.fogStart = vt.fogStart !== null ? vt.fogStart : preset.fogStart;
+      scene.fogEnd = vt.fogEnd !== null ? vt.fogEnd : preset.fogEnd;
+      if (scene.fogStart >= scene.fogEnd) {
+        scene.fogStart = Math.max(20, scene.fogEnd - 40);
+      }
+
+      // ClearColor (sky background) — separate from sky meshes.
+      if (vt.clearColorOverrideHex) {
+        scene.clearColor = parseHexColor4(
+          vt.clearColorOverrideHex,
+          new BABYLON.Color4(0.05, 0.03, 0.08, 1.0)
+        );
+        this.skyColorSource = "debug override (clearColor)";
+        this.activeSkyColorHex = vt.clearColorOverrideHex;
+      } else {
+        scene.clearColor = parseHexColor4(
+          resolvedSkyColor,
+          new BABYLON.Color4(0.05, 0.03, 0.08, 1.0)
+        );
+        this.activeSkyColorHex = resolvedSkyColor;
+      }
+    } else {
+      this.skyColorSource = "isolate sky (debug)";
+      this.activeSkyColorHex = "#03030A";
+      this.fogColorSource = "isolate sky (debug)";
+      this.activeFogColorHex = "#03030A";
     }
 
     // ---- Real day/night brightness ----
-    // Scale ambient + sun light intensities by sun altitude so night is dark.
     // altitude: -1 (midnight) .. 0 (horizon) .. +1 (noon)
     const dayT = Math.max(0, altitude); // 0 at night, 1 at noon
     const nightT = Math.max(0, -altitude); // 0 at day, 1 at midnight
 
-    const ambientIntensity =
+    let ambientIntensity =
       (vt.dayAmbientIntensity * dayT + vt.nightAmbientIntensity * (1 - dayT)) *
       vt.ambientIntensityMultiplier;
-    const sunIntensity =
+    let sunIntensity =
       (altitude > 0
         ? vt.noonSunIntensity * Math.sqrt(altitude)
         : vt.midnightSunIntensity) * vt.sunIntensityMultiplier;
 
+    // ---- Test modes override lighting ----
+    if (this.fullDarkTestActive) {
+      ambientIntensity = 0.0;
+      sunIntensity = 0.0;
+    } else if (this.noonLightingTestActive) {
+      ambientIntensity = vt.dayAmbientIntensity * vt.ambientIntensityMultiplier;
+      sunIntensity = vt.noonSunIntensity * vt.sunIntensityMultiplier;
+    } else if (this.lampOnlyTestActive) {
+      ambientIntensity = 0.0;
+      sunIntensity = 0.0;
+    }
+
+    // ---- Drive scene.ambientColor from the day/night cycle ----
+    // THIS is the key fix: noa sets scene.ambientColor=(0.5,0.5,0.5) at boot
+    // and the old code never changed it. With material.ambientColor=(1,1,1),
+    // that produced a constant 0.5 fill that prevented night from ever getting
+    // dark and drowned out placed dynamic lights. Now we interpolate between
+    // nightSceneAmbient (low) and daySceneAmbient (higher), tinted by the
+    // preset's ambientColor, and scaled by the multiplier + test modes.
+    const sceneAmbientBrightness =
+      (this.fullDarkTestActive || this.lampOnlyTestActive)
+        ? 0.0
+        : this.noonLightingTestActive
+        ? vt.daySceneAmbient
+        : (vt.daySceneAmbient * dayT + vt.nightSceneAmbient * nightT) * vt.sceneAmbientMultiplier;
+    const [ar, ag, ab] = preset.ambientColor;
+    scene.ambientColor = new BABYLON.Color3(
+      ar * sceneAmbientBrightness,
+      ag * sceneAmbientBrightness,
+      ab * sceneAmbientBrightness
+    );
+
+    // ---- Apply sun + ambient + moon light intensities ----
     if (this.skyController) {
       const sunLight = this.skyController.getSunLight();
       if (sunLight) {
-        sunLight.intensity = vt.dynamicLightsEnabled !== false ? sunIntensity : 0;
+        sunLight.intensity = (this.lampOnlyTestActive || this.fullDarkTestActive)
+          ? 0
+          : (vt.dynamicLightsEnabled !== false ? sunIntensity : 0);
       }
       const ambient = this.skyController.getAmbientLight();
       if (ambient) {
         ambient.intensity = ambientIntensity;
       }
+      // Moon light: driven by night factor unless a test mode suppresses it.
+      const moonNight = this.lampOnlyTestActive || this.fullDarkTestActive ? 0 : nightT;
+      const moonLight = this.skyController.getMoonLight();
+      if (moonLight) {
+        moonLight.intensity = vt.moonLightEnabled ? vt.moonLightIntensity * moonNight : 0;
+      }
     }
 
     // ---- Apply glow/bloom/postprocess overrides ----
-    this.renderPipelineService?.setGlowEnabled(vt.glowEnabled);
-    if (vt.glowEnabled) {
-      this.renderPipelineService?.setGlowIntensity(vt.glowIntensity);
+    // Lamp Only Test: force glow/bloom OFF so only dynamic lights show.
+    if (this.lampOnlyTestActive) {
+      this.renderPipelineService?.setGlowEnabled(false);
+      this.renderPipelineService?.setBloomEnabled(false);
+    } else {
+      this.renderPipelineService?.setGlowEnabled(vt.glowEnabled);
+      if (vt.glowEnabled) {
+        this.renderPipelineService?.setGlowIntensity(vt.glowIntensity);
+      }
+      this.renderPipelineService?.setBloomEnabled(vt.bloomEnabled);
     }
-    this.renderPipelineService?.setBloomEnabled(vt.bloomEnabled);
     this.renderPipelineService?.setExposure(vt.exposure);
     this.renderPipelineService?.setContrast(vt.contrast);
 
-    // ---- Apply sky visibility overrides ----
+    // ---- Apply sky visibility overrides (respects master meshesEnabled) ----
     this.skyController?.setVisibilityOverrides({
       sunVisible: vt.sunVisible,
       moonVisible: vt.moonVisible,
@@ -1139,17 +1723,21 @@ export class NoaEngineAdapter {
       starBrightness: vt.starBrightness,
     });
 
-    // ---- Apply terrain material mode ----
-    if (vt.terrainMaterialMode === "debug") {
-      this.applyTerrainDebugMaterial(true);
-    } else {
-      this.applyTerrainDebugMaterial(false);
+    // ---- Apply terrain material mode (only on change, not every frame) ----
+    if (vt.terrainMaterialMode !== this.currentTerrainMaterialMode) {
+      if (vt.terrainMaterialMode === "debug") {
+        this.applyTerrainDebugMaterial(true);
+      } else {
+        this.applyTerrainDebugMaterial(false);
+      }
+      this.currentTerrainMaterialMode = vt.terrainMaterialMode;
     }
   }
 
   /**
    * Merge mod sky overlays (ModRegistry.getActiveSky) on top of a base preset.
-   * Mod values are advisory; clampPreset() still enforces hard safety floors.
+   * Only called when `modSkyOverlayActive` is true (opt-in). Returns the merged
+   * preset; the caller tracks which fields changed for source labeling.
    */
   private mergeModSkyOverlay(base: import('./rendering/visual-presets').VisualPreset) {
     const skyMod = ModRegistry.getInstance().getActiveSky();
