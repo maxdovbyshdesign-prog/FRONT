@@ -19,6 +19,7 @@ import { AudioService } from '../audio/audio-service';
 import { MaterialService } from './rendering/material-service';
 import { RenderPipelineService } from './rendering/render-pipeline-service';
 import { WorldLightManager } from './rendering/world-light-manager';
+import { VoxelLightManager, type BlockLightResolver } from './rendering/voxel-light-manager';
 import { SkyController } from './rendering/sky-controller';
 import {
   getGraphicsSettings,
@@ -107,6 +108,15 @@ function readVisualSanityMode(): boolean {
   }
 }
 
+/** Detect ?resetVisual=1 to clear saved visual settings on boot. */
+function shouldResetVisualSettings(): boolean {
+  try {
+    return new URLSearchParams(window.location.search).get("resetVisual") === "1";
+  } catch {
+    return false;
+  }
+}
+
 /**
  * NoaEngineAdapter - Bridging engine adapter that decouples the 3D game canvas
  * and controls from pure business and React logic.
@@ -152,52 +162,24 @@ export class NoaEngineAdapter {
   private terrainDebugMat: BABYLON.StandardMaterial | null = null;
   /** Original chunk materials (saved when debug material is forced). */
   private savedChunkMaterials: Map<string, BABYLON.Material | null> = new Map();
-  /** Tracks the currently-applied terrain material mode to avoid per-frame re-application. */
-  private currentTerrainMaterialMode: "default" | "custom" | "debug" = "default";
   /** Live-tunable visual parameters (F3 debug console). */
-  private visualTuning: VisualTuning = loadVisualTuning();
+  private visualTuning: VisualTuning = shouldResetVisualSettings()
+    ? (localStorage.removeItem("frontierPlanet.visualSettings"), { ...DEFAULT_VISUAL_TUNING })
+    : loadVisualTuning();
 
   // Rendering services (Pass 1).
   private materialService: MaterialService | null = null;
   private renderPipelineService: RenderPipelineService | null = null;
   private worldLightManager: WorldLightManager | null = null;
   private skyController: SkyController | null = null;
+  /**
+   * VoxelLightManager — Minecraft-style per-cell baked lighting (skyLight +
+   * RGB blockLight flood-fill). This is the PERFORMANCE lighting model: light
+   * is baked into chunk mesh vertex colors, NOT real Babylon PointLights. Real
+   * dynamic lights (WorldLightManager) are debug-only, capped 0-3.
+   */
+  private voxelLightManager: VoxelLightManager | null = null;
   private graphicsSettings: GraphicsSettings;
-
-  // ---- Debug source tracking (sky/fog color provenance) ----
-  /** Human-readable source of the currently-applied sky/clear color. */
-  private skyColorSource: string = "built-in preset";
-  /** Human-readable source of the currently-applied fog color. */
-  private fogColorSource: string = "built-in preset";
-  /** Active sky (clear) color as a hex string, for F3 readback. */
-  private activeSkyColorHex: string = "#000000";
-  /** Active fog color as a hex string, for F3 readback. */
-  private activeFogColorHex: string = "#000000";
-  /** Whether the mod sky overlay is currently applied to the scene. */
-  private modSkyOverlayActive: boolean = false;
-  /** Current lighting phase label (dawn/day/dusk/night). */
-  private lightingPhase: string = "day";
-
-  // ---- Test-mode flags (Full Dark / Noon / Lamp Only) ----
-  /** When true, applyAtmosphereForCurrentPhase forces near-zero lighting. */
-  private fullDarkTestActive: boolean = false;
-  /** When true, forces bright noon lighting regardless of time-of-day. */
-  private noonLightingTestActive: boolean = false;
-  /** When true, disables fog/glow/bloom + near-zero ambient/sun/moon, dynamic lights on. */
-  private lampOnlyTestActive: boolean = false;
-
-  // ---- Chunk + FPS diagnostics ----
-  private chunkGenCount: number = 0;
-  private chunkGenTotalMs: number = 0;
-  private chunkGenMaxMs: number = 0;
-  private chunksThisWindow: number = 0;
-  private lastChunksPerSecTime: number = Date.now();
-  private chunksPerSec: number = 0;
-  private pendingChunkRequests: number = 0;
-  private frameCount: number = 0;
-  private fps: number = 0;
-  private lastFpsTime: number = performance.now();
-  private lastFpsFrameCount: number = 0;
 
   constructor(
     container: HTMLElement,
@@ -276,27 +258,7 @@ export class NoaEngineAdapter {
     // lamps, and the artifact) so the player sees a live world on boot.
     this.setupPreviewCamera();
 
-    // 8. Sync the mod sky overlay toggle (default OFF) so the legacy
-    // example-ruins-pack/sky/sky.json purple overlay does NOT silently
-    // dominate the built-in visual presets at boot.
-    this.syncModSkyOverlay();
-
     console.log('[NoaEngineAdapter] Standalone 3D voxel engine fully synchronized.');
-  }
-
-  /**
-   * Keep ModRegistry's mod-sky-overlay enable flag in sync with the VisualTuning
-   * `useModSkyOverlay` toggle. This is the single source of truth: the overlay
-   * is applied to the scene ONLY when both vt.useModSkyOverlay is true AND a mod
-   * has registered sky values. Default is OFF.
-   */
-  private syncModSkyOverlay(): void {
-    const reg = ModRegistry.getInstance();
-    const desired = this.visualTuning.useModSkyOverlay && reg.hasModSkyOverlay();
-    if (reg.isModSkyOverlayEnabled() !== desired) {
-      reg.setModSkyOverlayEnabled(desired);
-    }
-    this.modSkyOverlayActive = desired && reg.hasModSkyOverlay();
   }
 
   /**
@@ -316,31 +278,25 @@ export class NoaEngineAdapter {
     try {
       const cam = (this.noa as any).camera;
       if (!cam) return;
-      // Sun orbital position at timeOfDay matches SkyController:
+      // Sun orbital position at timeOfDay:
       //   angle = timeOfDay * 2π
-      //   sunPos = (cos(angle)*r, sin(angle)*r, r*0.5)
-      // We point the camera at the sun so the celestial body is ON-SCREEN at
-      // boot (the old fixed downward pitch hid the high sun behind the top of
-      // the viewport). A reduced pitch keeps terrain visible in the lower frame.
+      //   sunDir = (cos(angle), sin(angle), 0.5)  [matches SkyController]
+      // The sun's horizontal direction from the player is (cos, 0, 0.5/z-normalized).
+      // noa camera heading: 0 = +Z, π/2 = +X, π = -Z, 3π/2 = -X.
+      // heading = atan2(sunDirX, sunDirZ) faces the sun.
       const angle = this.timeOfDay * Math.PI * 2;
       const sunDirX = Math.cos(angle);
-      const sunDirY = Math.sin(angle);
       const sunDirZ = 0.5; // matches SkyController's +z*0.5 bias
       let heading = Math.atan2(sunDirX, sunDirZ);
       if (heading < 0) heading += Math.PI * 2;
       cam.heading = heading;
-      // Sun elevation angle above the horizon (radians).
-      const horiz = Math.sqrt(sunDirX * sunDirX + sunDirZ * sunDirZ);
-      const sunElevation = Math.atan2(sunDirY, horiz);
-      // Aim the camera halfway between the horizon and the sun so BOTH the sun
-      // (upper frame) and terrain (lower frame) are visible. noa's pitch is
-      // applied as holder.rotation.x: POSITIVE = look DOWN, NEGATIVE = look UP.
-      // The sun is up, so we use a negative (upward) pitch, scaled to half the
-      // sun's elevation so terrain isn't lost.
-      const pitch = -sunElevation * 0.55;
-      cam.pitch = Math.max(-0.9, Math.min(0.3, pitch));
+      // Slight DOWNWARD pitch so terrain is visible in the lower half of the
+      // frame. noa applies pitch as holder.rotation.x; in Babylon a positive
+      // rotation.x on a +Z-facing camera tilts it downward. We use a small
+      // positive value so the player sees ground, not sky.
+      cam.pitch = 0.12;
       console.log(
-        `[NoaEngineAdapter] Preview camera set: heading=${(heading * 180 / Math.PI).toFixed(0)}°, pitch=${cam.pitch.toFixed(2)} rad (aiming at sun, timeOfDay=${this.timeOfDay.toFixed(3)}).`
+        `[NoaEngineAdapter] Preview camera set: heading=${(heading * 180 / Math.PI).toFixed(0)}°, pitch=${cam.pitch.toFixed(2)} rad (facing sun at timeOfDay=${this.timeOfDay.toFixed(3)}).`
       );
     } catch (e) {
       console.warn('[NoaEngineAdapter] Preview camera setup failed:', e);
@@ -372,10 +328,7 @@ export class NoaEngineAdapter {
       scene,
       this.noa.registry,
       maxLights,
-      this.noa.rendering ?? null,
-      undefined, // safeMaterialsMode (reads ?safeMaterials=1)
-      undefined, // customTerrainMaterialsMode (reads ?customTerrainMaterials=1)
-      this.visualTuning.litTerrainMaterials
+      this.noa.rendering ?? null
     );
     this.materialService.registerAll(this.blockService.getBlockDefinitions());
   }
@@ -401,7 +354,7 @@ export class NoaEngineAdapter {
       this.graphicsSettings
     );
 
-    // Sky + celestial bodies + sun/ambient lights.
+    // Sky + celestial bodies + sun/ambient/moon lights.
     // Pass an octree-registration callback so sky meshes are added to noa's
     // octree dynamicContent — without this, noa's OctreeSceneComponent excludes
     // them from active-mesh candidates and they NEVER RENDER.
@@ -412,12 +365,109 @@ export class NoaEngineAdapter {
       }
     });
 
+    // Disable noa-engine's default DirectionalLight ("light"). It's an unmanaged
+    // second sun that fights our SkyController + consumes a material light slot.
+    const noaDefaultLight = scene.lights.find((l: any) => l.name === "light");
+    if (noaDefaultLight) {
+      noaDefaultLight.setEnabled(false);
+      console.log("[NoaEngineAdapter] Disabled noa default light 'light' (second sun).");
+    }
+
     // World light registry. Pre-seed static + generated lights from WorldService.
+    // NOTE: WorldLightManager (real Babylon PointLights) is now DEBUG-ONLY, capped
+    // to 0-3 lights by default. The primary lighting model is VoxelLightManager
+    // (cheap baked vertex-color light). Real lights are reserved for an optional
+    // "debug_real_lights" preset.
     this.worldLightManager = new WorldLightManager(scene, this.graphicsSettings);
     this.worldLightManager.registerStaticLights(
       this.worldService.getStaticLightSources(),
       (id) => this.blockService.getBlock(id)
     );
+    // Cap real PointLights at 3 (debug only) — they are NOT the main lighting.
+    this.worldLightManager.setBudget(3);
+
+    // VoxelLightManager — the PERFORMANCE lighting model. Minecraft-style per-cell
+    // skyLight + RGB blockLight baked into chunk mesh vertex colors. No real
+    // PointLights per glowing block. This reserves the GPU/CPU budget for
+    // sandbox simulation, not realistic lighting.
+    const blockResolver: BlockLightResolver = {
+      isOpaque: (blockId: number) => {
+        const def = this.blockService.getBlock(blockId);
+        // Air and non-solid blocks are transparent to light; solid opaque blocks block it.
+        if (!def) return false;
+        return def.opaque !== false && def.solid !== false;
+      },
+      isAir: (blockId: number) => blockId === 0,
+      getEmission: (blockId: number) => {
+        const def = this.blockService.getBlock(blockId);
+        if (!def || !def.light) return null;
+        // Map the block's LightProfile to a 0-15 voxel light level.
+        // intensity ~1.5-2.2 → level 12-15; range informs radius (capped by MAX_LIGHT_RADIUS).
+        const level = Math.max(1, Math.min(15, Math.round((def.light.intensity ?? 1) * 7)));
+        const col = def.light.color || def.color || [1, 1, 1];
+        return { level, r: col[0], g: col[1], b: col[2] };
+      },
+    };
+    this.voxelLightManager = new VoxelLightManager(blockResolver, (x, y, z) => this.getBlockIdAt(x, y, z));
+
+    // Seed the voxel light source registry with all static + generated light
+    // sources so cross-chunk propagation works: when a chunk is recomputed,
+    // VoxelLightManager queries this registry for neighbor sources within
+    // MAX_LIGHT_RADIUS and seeds them into the BFS so light correctly crosses
+    // chunk edges (previously only internal sources seeded — neighbor chunks
+    // never received boundary light from adjacent torches).
+    try {
+      const staticSeeds = this.worldService.getStaticLightSources();
+      let seeded = 0;
+      for (const s of staticSeeds) {
+        const def = this.blockService.getBlock(s.blockId);
+        if (def) {
+          this.voxelLightManager.registerLight(s.pos[0], s.pos[1], s.pos[2], def);
+          seeded++;
+        }
+      }
+      console.log(`[NoaEngineAdapter] Seeded voxel light source registry with ${seeded} static sources.`);
+    } catch (e) {
+      console.warn('[NoaEngineAdapter] Static voxel light seed failed:', e);
+    }
+
+    // Disable the real-light system by default (performance mode). Real
+    // PointLights only turn on if the user picks the "debug_real_lights" preset.
+    this.worldLightManager.setEnabled(false);
+    console.log("[NoaEngineAdapter] Real dynamic PointLights DISABLED by default (performance voxel mode). Use F3 → 'debug_real_lights' preset to enable.");
+
+    // Hook noa's chunk-mesh-built event to bake voxel light into vertex colors.
+    // This fires AFTER noa writes matColor×AO colors but BEFORE freezeNormals,
+    // so we can overwrite colors with matColor×AO×brightness(skyLight,blockLight).
+    try {
+      (this.noa as any).on('addingTerrainMesh', (mesh: any) => {
+        if (!mesh || !mesh.name || !mesh.name.startsWith('chunk_')) return;
+        const ox = mesh.position ? Math.floor(mesh.position.x) : 0;
+        const oy = mesh.position ? Math.floor(mesh.position.y) : 0;
+        const oz = mesh.position ? Math.floor(mesh.position.z) : 0;
+        this.voxelLightManager?.recolorMesh(mesh, ox, oy, oz);
+        // After recoloring the new mesh, also recolor any NEIGHBOR meshes
+        // whose light data may have changed due to this chunk's geometry.
+        // This catches the case where noa remeshes one chunk but the light
+        // data of a neighbor (already recomputed by relightAround) hasn't
+        // been applied to the neighbor's mesh yet.
+        const cx = Math.floor(ox / CHUNK_SIZE);
+        const cy = Math.floor(oy / CHUNK_SIZE);
+        const cz = Math.floor(oz / CHUNK_SIZE);
+        const neighborKeys: string[] = [];
+        for (let dx = -1; dx <= 1; dx++) {
+          for (let dy = -1; dy <= 1; dy++) {
+            for (let dz = -1; dz <= 1; dz++) {
+              if (dx === 0 && dy === 0 && dz === 0) continue;
+              neighborKeys.push(`${cx+dx},${cy+dy},${cz+dz}`);
+            }
+          }
+        }
+        this.voxelLightManager?.recolorAffectedMeshes(scene, neighborKeys);
+      });
+    } catch (e) {
+      console.warn('[NoaEngineAdapter] addingTerrainMesh hook failed:', e);
+    }
 
     // Apply the initial visual preset (fog / clearColor / ambient tuning).
     this.applyAtmosphereForCurrentPhase([0, 15, 0]);
@@ -551,42 +601,14 @@ export class NoaEngineAdapter {
           adapter.setTimeOfDay(t);
           return adapter.timeOfDay;
         },
-        /**
-         * MASTER sky-mesh toggle ("Sky Off / Sky On"). Now PERSISTS — it flips
-         * SkyController.setMeshesEnabled(), which setVisibilityOverrides()
-         * respects every frame. Previously this called a one-shot setVisible()
-         * that was immediately re-enabled next frame, so the buttons appeared
-         * to do nothing.
-         */
+        /** Toggle sky mesh visibility for QA (isolates sky occlusion issues). */
         setSkyVisible(visible: boolean) {
           if (adapter.skyController) {
-            adapter.skyController.setMeshesEnabled(visible);
+            adapter.skyController.setVisible(visible);
             return visible;
           }
           return null;
         },
-        /** Granular per-body enable (sun/moon/stars/clouds) via VisualTuning. */
-        setSkyBodyVisible(body: "sun" | "moon" | "stars" | "clouds", visible: boolean) {
-          const key = body === "sun" ? "sunVisible"
-            : body === "moon" ? "moonVisible"
-            : body === "stars" ? "starsVisible"
-            : "cloudsVisible";
-          adapter.updateVisualTuning({ [key]: visible });
-          return visible;
-        },
-        /** Toggle the legacy mod sky overlay (opt-in, default OFF). */
-        setModSkyOverlay(enabled: boolean) {
-          adapter.setModSkyOverlay(enabled);
-          return adapter.modSkyOverlayActive;
-        },
-        /** Full Dark lighting test (ambient/sun/moon → 0). */
-        fullDarkTest() { adapter.fullDarkTest(); },
-        /** Noon lighting test (bright day). */
-        noonLightingTest() { adapter.noonLightingTest(); },
-        /** Lamp Only test (fog/glow/bloom off, ambient/sun/moon → 0, lights on). */
-        lampOnlyTest() { adapter.lampOnlyTest(); },
-        /** Clear all lighting test modes. */
-        clearLightingTests() { adapter.clearLightingTests(); },
         /** Toggle fog on/off for QA. */
         setFogEnabled(enabled: boolean) {
           const sc = adapter.getSceneSafe();
@@ -701,162 +723,247 @@ export class NoaEngineAdapter {
         importVisualSettings(settings: any) {
           return adapter.importVisualSettings(settings);
         },
-        /**
-         * Isolate sky — hide terrain + world lights, disable fog, set a dark
-         * readable clearColor (NOT purple), ensure sky meshes are on, and point
-         * the camera at the sun/moon so bodies are on-screen. Pass false to
-         * restore. Delegates to the adapter method.
-         */
+        /** Isolate sky (hide terrain + world lights, show only sky). */
         isolateSky(isolated: boolean) {
-          adapter.isolateSky(isolated);
-        },
-        /** Apply pending chunk distances (requires renderer restart). Best-effort. */
-        applyChunkDistances(add: number, remove: number) {
-          try {
-            const worldAny = (adapter as any).noa?.world as any;
-            if (worldAny) {
-              if (typeof worldAny.setChunkAddDistance === 'function') worldAny.setChunkAddDistance(add);
-              if (typeof worldAny.setChunkRemoveDistance === 'function') worldAny.setChunkRemoveDistance(remove);
+          const sc = adapter.getSceneSafe();
+          if (!sc) return;
+          sc.meshes.forEach((m: any) => {
+            if (m.name.startsWith("chunk_") || m.name.startsWith("wl-")) {
+              m.setEnabled(!isolated);
             }
-          } catch { /* noa may not support live changes */ }
-          adapter.updateVisualTuning({ pendingChunkAddDistance: add, pendingChunkRemoveDistance: remove });
-          console.warn('[NoaEngineAdapter] Chunk distance changes usually require a renderer restart to fully apply.');
+          });
+          console.log(`[NoaEngineAdapter] Sky ${isolated ? "isolated" : "restored"}.`);
+        },
+        /** Toggle the real Babylon PointLight system (debug only, capped 0-3). */
+        toggleRealPointLights(enabled: boolean) {
+          adapter.worldLightManager?.setEnabled(enabled);
+          if (enabled) {
+            adapter.worldLightManager?.setBudget(3);
+            console.log("[NoaEngineAdapter] Real PointLights ON (debug, cap 3).");
+          } else {
+            console.log("[NoaEngineAdapter] Real PointLights OFF (performance voxel mode).");
+          }
+        },
+        /** Force a full voxel-light relight of all known chunks (synchronous). */
+        forceRelightAll() {
+          const sc = adapter.getSceneSafe();
+          const result = adapter.voxelLightManager?.forceRelightAllImmediate(sc);
+          console.log(`[NoaEngineAdapter] Force relight IMMEDIATE: recomputed ${result?.recomputedChunks ?? 0} chunks, recolored ${result?.recoloredMeshCount ?? 0} meshes in ${result?.durationMs.toFixed(1) ?? '0'}ms.`);
+        },
+        /** Recolor Stability Test — run recolorMesh 20x, verify no darkening. */
+        recolorStabilityTest() {
+          const sc = adapter.getSceneSafe();
+          const result = adapter.voxelLightManager?.recolorStabilityTest(sc);
+          console.log("[NoaEngineAdapter] RECOLOR STABILITY TEST:", JSON.stringify(result));
+          return result;
+        },
+        /** Glow Off Lighting Test — disable GlowLayer, place a torch, verify surface illumination. */
+        glowOffLightingTest() {
+          const sc = adapter.getSceneSafe();
+          if (!sc) return;
+          adapter.updateVisualTuning({ glowEnabled: false, bloomEnabled: false });
+          adapter.worldLightManager?.setEnabled(false);
+          adapter.voxelLightManager?.setLightingMode("performance_voxel");
+          const pp = adapter.getPlayerPositionSafe() || [0, 15, 0];
+          // Find ground level near the player.
+          let gy = Math.floor(pp[1]);
+          for (let y = Math.floor(pp[1]); y > 0; y--) {
+            const id = adapter.getBlockIdAt(Math.floor(pp[0]) + 2, y, Math.floor(pp[2]));
+            if (id !== 0) { gy = y + 1; break; }
+          }
+          const lx = Math.floor(pp[0]) + 2;
+          const ly = gy;
+          const lz = Math.floor(pp[2]);
+          adapter.worldService.setBlockOverride(lx, ly, lz, 7);
+          adapter.noa.setBlock(7, lx, ly, lz);
+          const bd = adapter.blockService.getBlock(7);
+          if (bd) {
+            adapter.worldLightManager?.registerLight(lx, ly, lz, bd);
+            adapter.voxelLightManager?.registerLight(lx, ly, lz, bd);
+          }
+          adapter.voxelLightManager?.relightAround(sc, lx, ly, lz);
+          const count = adapter.voxelLightManager?.recolorAllVisibleChunkMeshes(sc) ?? 0;
+          console.log(`[NoaEngineAdapter] GLOW OFF LIGHTING TEST: glow disabled, placed torch at [${lx},${ly},${lz}], recolored ${count} meshes. Surface illumination should be visible WITHOUT glow.`);
+        },
+        /** Ruin Light Cluster Test — teleport to the ruin, verify no flicker. */
+        ruinLightClusterTest() {
+          const sc = adapter.getSceneSafe();
+          if (!sc) return;
+          adapter.worldLightManager?.setEnabled(false);
+          adapter.voxelLightManager?.setLightingMode("performance_voxel");
+          // Teleport player to the ruin center (has glowing spire blocks).
+          const ruinCenter = adapter.worldService.getRuinCenter();
+          const eng = adapter.noa;
+          eng.entities.setPosition(eng.playerEntity, [ruinCenter[0] + 2, ruinCenter[1] + 2, ruinCenter[2] + 2]);
+          // Force relight + immediate recolor (synchronous, not queued).
+          adapter.voxelLightManager?.forceRelightAllImmediate(sc);
+          console.log(`[NoaEngineAdapter] RUIN CLUSTER TEST: teleported to ruin [${ruinCenter}], force-relight immediate. No flicker should occur.`);
+        },
+        /** Single Torch Voxel Test — PLACE one yellow lamp on the ground near the player + relight + recolor. */
+        singleTorchVoxelTest() {
+          const sc = adapter.getSceneSafe();
+          if (!sc) return;
+          adapter.worldLightManager?.setEnabled(false);
+          adapter.voxelLightManager?.setLightingMode("performance_voxel");
+          const pp = adapter.getPlayerPositionSafe() || [0, 15, 0];
+          // Find the ground level near the player (scan down for the first solid block).
+          let gy = Math.floor(pp[1]);
+          for (let y = Math.floor(pp[1]); y > 0; y--) {
+            const id = adapter.getBlockIdAt(Math.floor(pp[0]) + 2, y, Math.floor(pp[2]));
+            if (id !== 0) { gy = y + 1; break; }
+          }
+          const lx = Math.floor(pp[0]) + 2;
+          const ly = gy;
+          const lz = Math.floor(pp[2]);
+          adapter.worldService.setBlockOverride(lx, ly, lz, 7);
+          adapter.noa.setBlock(7, lx, ly, lz);
+          const blockDef = adapter.blockService.getBlock(7);
+          if (blockDef) {
+            adapter.worldLightManager?.registerLight(lx, ly, lz, blockDef);
+            adapter.voxelLightManager?.registerLight(lx, ly, lz, blockDef);
+          }
+          adapter.voxelLightManager?.relightAround(sc, lx, ly, lz);
+          const count = adapter.voxelLightManager?.recolorAllVisibleChunkMeshes(sc) ?? 0;
+          console.log(`[NoaEngineAdapter] SINGLE TORCH TEST: placed yellow halogen at [${lx},${ly},${lz}], recolored ${count} meshes. A warm yellow pool should be visible.`);
+        },
+        /** Three Color Voxel Blend Test — PLACE yellow + cyan + magenta lamps + relight + recolor. */
+        threeColorVoxelBlendTest() {
+          const sc = adapter.getSceneSafe();
+          if (!sc) return;
+          adapter.worldLightManager?.setEnabled(false);
+          adapter.voxelLightManager?.setLightingMode("performance_voxel");
+          const pp = adapter.getPlayerPositionSafe() || [0, 15, 0];
+          // Place 3 lamps in a row: yellow (7=halogen), cyan (6=wall lamp), magenta (8=beacon).
+          const placements = [
+            { id: 7, dx: 2, dz: 0 },   // yellow
+            { id: 6, dx: 2, dz: 2 },   // cyan
+            { id: 8, dx: 2, dz: -2 },  // magenta
+          ];
+          for (const p of placements) {
+            const lx = Math.floor(pp[0]) + p.dx;
+            const ly = Math.floor(pp[1]);
+            const lz = Math.floor(pp[2]) + p.dz;
+            adapter.worldService.setBlockOverride(lx, ly, lz, p.id);
+            adapter.noa.setBlock(p.id, lx, ly, lz);
+            const bd = adapter.blockService.getBlock(p.id);
+            if (bd) {
+              adapter.worldLightManager?.registerLight(lx, ly, lz, bd);
+              adapter.voxelLightManager?.registerLight(lx, ly, lz, bd);
+            }
+            adapter.voxelLightManager?.relightAround(sc, lx, ly, lz);
+          }
+          const count = adapter.voxelLightManager?.recolorAllVisibleChunkMeshes(sc) ?? 0;
+          console.log(`[NoaEngineAdapter] THREE COLOR BLEND TEST: placed yellow+cyan+magenta lamps, recolored ${count} meshes. Three stable colored pools should be visible.`);
+        },
+        toggleVoxelAO(enabled: boolean) {
+          console.log(`[NoaEngineAdapter] Voxel AO is baked by noa's mesher (always on). Toggle: ${enabled}.`);
+        },
+        resetLightingPreset() {
+          adapter.worldLightManager?.setEnabled(false);
+          adapter.voxelLightManager?.setLightingMode("performance_voxel");
+          adapter.voxelLightManager?.setSkyLightEnabled(true);
+          adapter.voxelLightManager?.setBlockLightEnabled(true);
+          const sc = adapter.getSceneSafe();
+          const result = adapter.voxelLightManager?.forceRelightAllImmediate(sc);
+          console.log(`[NoaEngineAdapter] Lighting reset to PERFORMANCE VOXEL. Recomputed ${result?.recomputedChunks ?? 0} chunks, recolored ${result?.recoloredMeshCount ?? 0} meshes.`);
+        },
+        /** Visual Isolation ON — fog/glow/bloom OFF, real lights OFF, safe exposure. */
+        visualIsolationOn() {
+          adapter.updateVisualTuning({
+            fogEnabled: false, glowEnabled: false, bloomEnabled: false,
+            exposure: 1.3, contrast: 1.0, toneMappingEnabled: false,
+          });
+          adapter.worldLightManager?.setEnabled(false);
+          adapter.voxelLightManager?.setLightingMode("performance_voxel");
+          const sc = adapter.getSceneSafe();
+          if (sc) { sc.fogEnabled = false; }
+          console.log("[NoaEngineAdapter] VISUAL ISOLATION ON: fog/glow/bloom OFF, real lights OFF, exposure 1.3.");
+        },
+        /** Visual Isolation OFF — restore fog/glow to defaults. */
+        visualIsolationOff() {
+          adapter.updateVisualTuning({
+            fogEnabled: true, glowEnabled: true, glowIntensity: 0.12,
+            bloomEnabled: false, exposure: 1.3, contrast: 1.0,
+          });
+          console.log("[NoaEngineAdapter] VISUAL ISOLATION OFF: fog/glow restored to defaults.");
+        },
+        /** Clear saved visual settings from localStorage (reset to defaults). */
+        clearSavedVisualSettings() {
+          try { localStorage.removeItem("frontierPlanet.visualSettings"); } catch { /* ignore */ }
+          adapter.visualTuning = { ...DEFAULT_VISUAL_TUNING };
+          const sc = adapter.getSceneSafe();
+          adapter.voxelLightManager?.forceRelightAllImmediate(sc);
+          console.log("[NoaEngineAdapter] Cleared saved visual settings. Reset to defaults + relight.");
+        },
+        /** Show/hide chunk grid visualization. */
+        showChunkGrid(visible: boolean) {
+          const sc = adapter.getSceneSafe();
+          if (!sc) return;
+          if (visible) {
+            adapter.buildChunkGrid(sc);
+          } else {
+            adapter.removeChunkGrid(sc);
+          }
+        },
+        /** Inspect lighting at a world position (or crosshair if no args). */
+        inspectLightingAt(x?: number, y?: number, z?: number) {
+          let wx = x, wy = y, wz = z;
+          if (wx === undefined || wy === undefined || wz === undefined) {
+            // Use player position
+            const pp = adapter.getPlayerPositionSafe() || [0, 15, 0];
+            wx = Math.floor(pp[0]); wy = Math.floor(pp[1]); wz = Math.floor(pp[2]);
+          }
+          const result = adapter.voxelLightManager?.inspectLightingAt(wx, wy, wz);
+          console.log("[InspectLighting]", JSON.stringify(result, null, 2));
+          return result;
+        },
+        /** Light Sweep Test in a direction. Returns array of step results. */
+        async lightSweepTest(direction: "+X" | "-X" | "+Z" | "-Z" | "diag") {
+          return adapter.runLightSweep(direction);
+        },
+        /** Chunk Border Light Test. */
+        async chunkBorderLightTest() {
+          return adapter.runChunkBorderTest();
+        },
+        /** Ruin Stress Test. */
+        async ruinStressTest() {
+          return adapter.runRuinStressTest();
+        },
+        /** Get chunk grid debug info. */
+        getChunkGridDebug() {
+          const pp = adapter.getPlayerPositionSafe() || [0, 15, 0];
+          const cx = Math.floor(pp[0] / 16);
+          const cz = Math.floor(pp[2] / 16);
+          const lx = Math.floor(pp[0]) - cx * 16;
+          const lz = Math.floor(pp[2]) - cz * 16;
+          return {
+            playerWorldPos: [Math.floor(pp[0]), Math.floor(pp[1]), Math.floor(pp[2])],
+            playerChunkKey: `${cx},0,${cz}`,
+            playerLocalCell: [lx, Math.floor(pp[1]) % 16, lz],
+            distToBorderX: Math.min(lx, 15 - lx),
+            distToBorderZ: Math.min(lz, 15 - lz),
+            isNearBorder: Math.min(lx, 15-lx, lz, 15-lz) <= 2,
+            lastAffectedChunks: adapter.voxelLightManager?.getLastAffectedChunkKeys() ?? [],
+            relightQueueKeys: adapter.voxelLightManager?.getRelightQueueKeys() ?? [],
+            chunksWithLightData: adapter.voxelLightManager?.getChunkKeysWithLightData().length ?? 0,
+          };
         },
       };
 
-      // ---- Rich debug snapshots (computed lazily on property access) ----
-      Object.defineProperty(snapshot, 'sky', {
+      // ---- Voxel lighting debug snapshot (lazy) ----
+      Object.defineProperty(snapshot, 'voxelLighting', {
         get() {
-          if (!adapter.skyController) return null;
-          return adapter.skyController.getSkyDebug({
-            activeSkyColor: adapter.activeSkyColorHex,
-            skyColorSource: adapter.skyColorSource,
-            activeFogColor: adapter.activeFogColorHex,
-            fogColorSource: adapter.fogColorSource,
-            modSkyOverlayActive: adapter.modSkyOverlayActive,
-          });
-        },
-        configurable: true,
-      });
-      Object.defineProperty(snapshot, 'lights', {
-        get() {
-          const scene = adapter.getSceneSafe();
+          if (!adapter.voxelLightManager) return null;
           const playerPos = adapter.getPlayerPositionSafe() || [0, 15, 0];
-          const base = adapter.worldLightManager
-            ? adapter.worldLightManager.getDebugInfo(playerPos, 8)
-            : { registered: 0, active: 0, nearest: [] };
-          // Probe a sample chunk material's maxSimultaneousLights.
-          let terrainMaxLights: number | null = null;
-          let terrainDisableLighting: boolean | null = null;
-          let terrainEmissiveZero: boolean | null = null;
-          if (scene) {
-            const chunk = scene.meshes.find((m: any) => m.name.startsWith("chunk_") && m.material);
-            if (chunk && chunk.material) {
-              const mat = chunk.material as BABYLON.StandardMaterial;
-              terrainMaxLights = (mat as any).maxSimultaneousLights ?? null;
-              terrainDisableLighting = (mat as any).disableLighting ?? null;
-              const em = (mat as any).emissiveColor;
-              terrainEmissiveZero = em ? (em.r === 0 && em.g === 0 && em.b === 0) : null;
-            }
-          }
-          const budget = adapter.worldLightManager ? adapter.worldLightManager.getBudget() : adapter.graphicsSettings.maxActiveDynamicLights;
-          // Is the nearest placed light being limited by the budget?
-          let budgetLimitingNearest = false;
-          if (base.nearest && base.nearest.length) {
-            // If there are more registered lights than budget, any non-active
-            // nearest light is being culled by the budget.
-            budgetLimitingNearest = base.registered > budget && base.nearest.some((n: any) => !n.active);
-          }
+          const vinfo = adapter.voxelLightManager.getDebugInfo(playerPos);
+          const realActive = adapter.worldLightManager ? adapter.worldLightManager.getActiveCount() : 0;
           return {
-            ...base,
-            activeBudget: budget,
-            dynamicLightsEnabled: adapter.visualTuning.dynamicLightsEnabled,
-            terrainMaterialMaxSimultaneousLights: terrainMaxLights,
-            terrainMaterialDisableLighting: terrainDisableLighting,
-            terrainMaterialEmissiveZero: terrainEmissiveZero,
-            budgetLimitingNearest,
+            ...vinfo,
+            realPointLightsActive: realActive,
+            realPointLightCap: 3,
+            lightingMode: vinfo.lightingMode,
           };
         },
-        configurable: true,
-      });
-      Object.defineProperty(snapshot, 'lighting', {
-        get() {
-          const scene = adapter.getSceneSafe();
-          const amb = scene ? scene.ambientColor : null;
-          const sunLight = adapter.skyController?.getSunLight();
-          const ambient = adapter.skyController?.getAmbientLight();
-          const moon = adapter.skyController?.getMoonLight();
-          return {
-            timeOfDay: adapter.timeOfDay,
-            phase: adapter.lightingPhase,
-            sceneAmbientColor: amb ? [amb.r, amb.g, amb.b] : null,
-            hemisphericIntensity: ambient?.intensity ?? 0,
-            sunIntensity: sunLight?.intensity ?? 0,
-            sunDiffuse: sunLight?.diffuse ? [sunLight.diffuse.r, sunLight.diffuse.g, sunLight.diffuse.b] : null,
-            moonIntensity: moon?.intensity ?? 0,
-            moonDiffuse: moon?.diffuse ? [moon.diffuse.r, moon.diffuse.g, moon.diffuse.b] : null,
-            fullDarkTestActive: adapter.fullDarkTestActive,
-            noonLightingTestActive: adapter.noonLightingTestActive,
-            lampOnlyTestActive: adapter.lampOnlyTestActive,
-            requested: {
-              daySceneAmbient: adapter.visualTuning.daySceneAmbient,
-              nightSceneAmbient: adapter.visualTuning.nightSceneAmbient,
-              sceneAmbientMultiplier: adapter.visualTuning.sceneAmbientMultiplier,
-              ambientIntensityMultiplier: adapter.visualTuning.ambientIntensityMultiplier,
-              sunIntensityMultiplier: adapter.visualTuning.sunIntensityMultiplier,
-              noonSunIntensity: adapter.visualTuning.noonSunIntensity,
-              midnightSunIntensity: adapter.visualTuning.midnightSunIntensity,
-              moonLightEnabled: adapter.visualTuning.moonLightEnabled,
-              moonLightIntensity: adapter.visualTuning.moonLightIntensity,
-            },
-          };
-        },
-        configurable: true,
-      });
-      Object.defineProperty(snapshot, 'modSky', {
-        get() {
-          const reg = ModRegistry.getInstance();
-          return {
-            overlayActive: adapter.modSkyOverlayActive,
-            useModSkyOverlay: adapter.visualTuning.useModSkyOverlay,
-            registered: reg.hasModSkyOverlay(),
-            enabled: reg.isModSkyOverlayEnabled(),
-            config: reg.getActiveSky(),
-            sources: reg.getActiveSkySources(),
-            skyColorSource: adapter.skyColorSource,
-            fogColorSource: adapter.fogColorSource,
-            activeSkyColorHex: adapter.activeSkyColorHex,
-            activeFogColorHex: adapter.activeFogColorHex,
-          };
-        },
-        configurable: true,
-      });
-      Object.defineProperty(snapshot, 'chunks', {
-        get() {
-          const scene = adapter.getSceneSafe();
-          const meshCount = scene ? scene.meshes.filter((m: any) => m.name.startsWith("chunk_")).length : 0;
-          const avg = adapter.chunkGenCount > 0 ? adapter.chunkGenTotalMs / adapter.chunkGenCount : 0;
-          return {
-            chunkAddDistance: adapter.chunkAddDistance,
-            chunkRemoveDistance: adapter.chunkRemoveDistance,
-            pendingChunkAddDistance: adapter.visualTuning.pendingChunkAddDistance,
-            pendingChunkRemoveDistance: adapter.visualTuning.pendingChunkRemoveDistance,
-            blockDataNeededEmitInterval: BLOCK_DATA_NEEDED_EMIT_INTERVAL,
-            renderDistanceBlocks: adapter.getRenderDistanceBlocks(),
-            loadedChunkCount: meshCount,
-            totalGenerated: adapter.chunkGenCount,
-            avgGenMs: Number(avg.toFixed(2)),
-            maxGenMs: Number(adapter.chunkGenMaxMs.toFixed(2)),
-            chunksPerSec: adapter.chunksPerSec,
-            fps: adapter.fps,
-            fogMatchRenderDistance: adapter.visualTuning.fogMatchRenderDistance,
-            showChunkBoundaries: adapter.visualTuning.showChunkBoundaries,
-          };
-        },
-        configurable: true,
-      });
-      Object.defineProperty(snapshot, 'fps', {
-        get() { return adapter.fps; },
         configurable: true,
       });
 
@@ -914,20 +1021,6 @@ export class NoaEngineAdapter {
     if (patch.activeLightBudget !== undefined && this.worldLightManager) {
       this.worldLightManager.setBudget(patch.activeLightBudget);
     }
-    // Sync the mod sky overlay toggle whenever it changes.
-    if (patch.useModSkyOverlay !== undefined) {
-      this.syncModSkyOverlay();
-    }
-    // Propagate moon-light config to the sky controller.
-    if (this.skyController && (
-      patch.moonLightEnabled !== undefined ||
-      patch.moonLightIntensity !== undefined
-    )) {
-      this.skyController.setMoonLight({
-        enabled: this.visualTuning.moonLightEnabled,
-        intensity: this.visualTuning.moonLightIntensity,
-      });
-    }
     return this.getVisualTuning();
   }
 
@@ -950,18 +1043,6 @@ export class NoaEngineAdapter {
       if (preset.activeLightBudget !== undefined && this.worldLightManager) {
         this.worldLightManager.setBudget(preset.activeLightBudget);
       }
-      // Clear any active test modes when applying a preset.
-      this.fullDarkTestActive = false;
-      this.noonLightingTestActive = false;
-      this.lampOnlyTestActive = false;
-      // Sync mod overlay (presets set useModSkyOverlay:false so the legacy
-      // purple overlay never silently re-enables).
-      this.syncModSkyOverlay();
-      // Propagate moon-light config.
-      this.skyController?.setMoonLight({
-        enabled: this.visualTuning.moonLightEnabled,
-        intensity: this.visualTuning.moonLightIntensity,
-      });
       console.log(`[NoaEngineAdapter] Applied preset: ${name}`);
     }
     return this.getVisualTuning();
@@ -989,180 +1070,7 @@ export class NoaEngineAdapter {
     if (settings && typeof settings === "object") {
       this.visualTuning = { ...DEFAULT_VISUAL_TUNING, ...settings };
     }
-    this.syncModSkyOverlay();
-    this.skyController?.setMoonLight({
-      enabled: this.visualTuning.moonLightEnabled,
-      intensity: this.visualTuning.moonLightIntensity,
-    });
     return this.getVisualTuning();
-  }
-
-  // ---- Lighting test modes (F3 QA buttons) ----
-
-  /**
-   * FULL DARK TEST: ambient near zero, hemi=0, sun=0, moon=0. Normal terrain
-   * MUST become genuinely dark. If it doesn't, the terrain material is unlit /
-   * fullbright / emissive and must be fixed (disableLighting=false,
-   * emissiveColor=0). Clears other test modes.
-   */
-  public fullDarkTest(): void {
-    this.fullDarkTestActive = true;
-    this.noonLightingTestActive = false;
-    this.lampOnlyTestActive = false;
-    console.log("[NoaEngineAdapter] FULL DARK TEST active — terrain should be dark.");
-  }
-
-  /**
-   * NOON LIGHTING TEST: restore bright day lighting (ambient + sun at day
-   * values) regardless of time-of-day. Terrain should be bright.
-   */
-  public noonLightingTest(): void {
-    this.fullDarkTestActive = false;
-    this.noonLightingTestActive = true;
-    this.lampOnlyTestActive = false;
-    console.log("[NoaEngineAdapter] NOON LIGHTING TEST active — terrain should be bright.");
-  }
-
-  /**
-   * LAMP ONLY TEST: fog off, glow off, bloom off, ambient/sun/moon near zero,
-   * dynamic lights ENABLED. Place a yellow (halogen, id 7) or cyan (wall lamp,
-   * id 6) block — nearby terrain MUST receive colored illumination. Destroying
-   * the block removes the light. This proves PointLights actually light terrain
-   * (GlowLayer/emissive are NOT lighting).
-   */
-  public lampOnlyTest(): void {
-    this.fullDarkTestActive = false;
-    this.noonLightingTestActive = false;
-    this.lampOnlyTestActive = true;
-    // Ensure dynamic lights are on for this test, and boost the budget so the
-    // nearest placed lamp actually activates (the proximity-aware sort favors
-    // nearby lights, and a higher budget guarantees the test lamp isn't culled
-    // by far mission artifacts).
-    this.visualTuning.dynamicLightsEnabled = true;
-    this.visualTuning.activeLightBudget = Math.max(8, this.visualTuning.activeLightBudget);
-    this.worldLightManager?.setBudget(this.visualTuning.activeLightBudget);
-    console.log("[NoaEngineAdapter] LAMP ONLY TEST active — place lamps to verify dynamic lighting.");
-  }
-
-  /** Clear all lighting test modes (return to normal day/night). */
-  public clearLightingTests(): void {
-    this.fullDarkTestActive = false;
-    this.noonLightingTestActive = false;
-    this.lampOnlyTestActive = false;
-    console.log("[NoaEngineAdapter] Lighting test modes cleared.");
-  }
-
-  /** Toggle the mod sky overlay at runtime (F3). */
-  public setModSkyOverlay(enabled: boolean): void {
-    this.visualTuning.useModSkyOverlay = !!enabled;
-    this.syncModSkyOverlay();
-  }
-
-  /**
-   * ISOLATE SKY: hide terrain + world lights so only the celestial bodies
-   * remain. Unlike the old version (which left the purple mod-overlay
-   * clearColor), this:
-   *   - sets a sticky `skyIsolated` flag that applyAtmosphereForCurrentPhase()
-   *     respects (so the per-frame fog/clearColor apply does NOT overwrite the
-   *     isolate state)
-   *   - disables fog (so no haze hides the bodies)
-   *   - forces a dark, readable clearColor (not purple)
-   *   - ensures sky meshes are master-enabled
-   *   - repositions the camera to look toward the sun (so bodies are on-screen)
-   * Pass false to restore the scene.
-   */
-  public isolateSky(isolated: boolean): void {
-    const scene = this.getSceneSafe();
-    if (!scene) return;
-    this.skyIsolated = isolated;
-    if (isolated) {
-      // Stash current fog/clear state so we can restore.
-      this._preIsolateFogEnabled = scene.fogEnabled;
-      this._preIsolateClearColor = scene.clearColor ? scene.clearColor.clone() : null;
-      this._preIsolateSkyMeshesEnabled = this.skyController?.isMeshesEnabled() ?? true;
-
-      scene.meshes.forEach((m: any) => {
-        if (m.name.startsWith("chunk_") || m.name.startsWith("wl-")) {
-          m.setEnabled(false);
-        }
-      });
-      scene.fogEnabled = false;
-      // Dark navy, NOT purple — clearly readable for celestial bodies.
-      scene.clearColor = new BABYLON.Color4(0.01, 0.01, 0.03, 1.0);
-      this.skyController?.setMeshesEnabled(true);
-
-      // Reposition camera to look at the sun so bodies are on-screen.
-      this.pointCameraAtSun();
-      console.log("[NoaEngineAdapter] Sky isolated — terrain/lights hidden, camera pointed at sun.");
-    } else {
-      scene.meshes.forEach((m: any) => {
-        if (m.name.startsWith("chunk_") || m.name.startsWith("wl-")) {
-          m.setEnabled(true);
-        }
-      });
-      if (this._preIsolateFogEnabled !== null) scene.fogEnabled = this._preIsolateFogEnabled;
-      if (this._preIsolateClearColor) scene.clearColor = this._preIsolateClearColor;
-      if (this._preIsolateSkyMeshesEnabled !== null) {
-        this.skyController?.setMeshesEnabled(this._preIsolateSkyMeshesEnabled);
-      }
-      console.log("[NoaEngineAdapter] Sky restored — terrain/lights re-enabled.");
-    }
-  }
-
-  /** Sticky flag: when true, applyAtmosphereForCurrentPhase skips fog/clearColor. */
-  private skyIsolated: boolean = false;
-
-  private _preIsolateFogEnabled: boolean | null = null;
-  private _preIsolateClearColor: BABYLON.Color4 | null = null;
-  private _preIsolateSkyMeshesEnabled: boolean | null = null;
-
-  /**
-   * Point the noa/Babylon camera toward the current sun (or moon) position so
-   * celestial bodies are CENTERED on-screen (used by Isolate Sky). Does NOT
-   * request pointer lock. noa applies cam.heading/pitch to the camera holder
-   * every render frame, and these persist when pointer lock is not active.
-   *
-   * Convention (from noa-engine camera.js):
-   *   - heading 0 = +Z, heading π/2 = +X (yaw around Y)
-   *   - pitch: POSITIVE = look DOWN, NEGATIVE = look UP (rotateX)
-   * So to look UP at a sun above the horizon, pitch must be NEGATIVE.
-   */
-  private pointCameraAtSun(): void {
-    try {
-      const cam = (this.noa as any).camera;
-      const scene = this.getSceneSafe();
-      if (!cam || !scene) return;
-      const sunMesh = scene.getMeshByName("fp_sun");
-      const moonMesh = scene.getMeshByName("fp_moon");
-      // Prefer whichever body is currently visible.
-      const target = sunMesh && sunMesh.isEnabled() && sunMesh.isVisible
-        ? sunMesh
-        : moonMesh && moonMesh.isEnabled() && moonMesh.isVisible
-        ? moonMesh
-        : sunMesh ?? moonMesh ?? null;
-      if (!target) return;
-      const tpos = target.getAbsolutePosition();
-      // Camera world position = the holder position (camera is parented to it).
-      const holder = (this.noa as any).rendering?._cameraHolder;
-      const cpos = holder ? holder.position : (scene.activeCamera ? scene.activeCamera.position : null);
-      if (!cpos || !tpos) return;
-      const dx = tpos.x - cpos.x;
-      const dz = tpos.z - cpos.z;
-      const dy = tpos.y - cpos.y;
-      // heading = atan2(dx, dz) (0 = +Z, π/2 = +X)
-      let heading = Math.atan2(dx, dz);
-      if (heading < 0) heading += Math.PI * 2;
-      cam.heading = heading;
-      // pitch: NEGATIVE to look up. Center the body fully.
-      const horiz = Math.sqrt(dx * dx + dz * dz);
-      const elevation = Math.atan2(dy, horiz); // positive when sun is above
-      const pitch = -elevation; // negate so camera looks UP
-      // Clamp to noa's safe range (just under ±π/2).
-      cam.pitch = Math.max(-Math.PI / 2 + 0.05, Math.min(Math.PI / 2 - 0.05, pitch));
-      console.log(`[NoaEngineAdapter] Camera pointed at ${target.name} (heading=${(heading * 180 / Math.PI).toFixed(0)}°, pitch=${(cam.pitch * 180 / Math.PI).toFixed(0)}°).`);
-    } catch (e) {
-      console.warn("[NoaEngineAdapter] pointCameraAtSun failed:", e);
-    }
   }
 
   /**
@@ -1200,7 +1108,6 @@ export class NoaEngineAdapter {
       this.savedChunkMaterials.clear();
       console.log("[NoaEngineAdapter] Terrain debug material OFF (originals restored).");
     }
-    this.currentTerrainMaterialMode = enabled ? "debug" : "default";
     return enabled;
   }
 
@@ -1215,22 +1122,31 @@ export class NoaEngineAdapter {
     this.noa.world.on('worldDataNeeded', (id: string, ndarray: any, x: number, y: number, z: number) => {
       const start = performance.now();
       const shape = ndarray.shape;
+      // Fill voxel data + collect into a flat Uint16Array for the light manager.
+      const flatVoxels = new Uint16Array(shape[0] * shape[1] * shape[2]);
       for (let i = 0; i < shape[0]; ++i) {
         for (let j = 0; j < shape[1]; ++j) {
           for (let k = 0; k < shape[2]; ++k) {
             const voxelId = this.worldService.getBlockAt(x + i, y + j, z + k);
             ndarray.set(i, j, k, voxelId);
+            // noa ndarray is [i][j][k] = x,y,z; our flat array uses ly*size² + lx*size + lz.
+            flatVoxels[j * shape[0] * shape[2] + i * shape[2] + k] = voxelId;
           }
         }
       }
+      // CRITICAL FIX: Compute voxel light data BEFORE setChunkData.
+      // The old code called setChunkData first, which triggers noa's mesh
+      // creation + addingTerrainMesh event. That event calls recolorMesh,
+      // which ran BEFORE light data existed → mesh got black/fallback colors.
+      // Now light data is computed first, so when addingTerrainMesh fires,
+      // the light lookup succeeds and the mesh gets correct colors.
+      this.voxelLightManager?.computeInitialLight(x, y, z, flatVoxels);
+      // Also register any light sources found in this chunk into the global
+      // voxelLightSources registry, so neighbor chunks (which may load later)
+      // can seed cross-chunk propagation from this chunk's sources.
+      this.voxelLightManager?.registerSourcesFromVoxels(x, y, z, flatVoxels);
       this.noa.world.setChunkData(id, ndarray);
       const elapsed = performance.now() - start;
-
-      // Chunk diagnostics for F3: total count, avg/max gen time, chunks/sec.
-      this.chunkGenCount++;
-      this.chunkGenTotalMs += elapsed;
-      if (elapsed > this.chunkGenMaxMs) this.chunkGenMaxMs = elapsed;
-      this.chunksThisWindow++;
 
       if (ENABLE_PERF_LOGS) {
         this.chunkTimes.push(elapsed);
@@ -1335,12 +1251,23 @@ export class NoaEngineAdapter {
 
     AudioService.getInstance().playBlockDestroy();
 
+    // 1. Unregister light sources BEFORE setBlock (so relight doesn't seed
+    //    from a block that's about to be destroyed).
+    this.worldLightManager?.unregisterLight(pos[0], pos[1], pos[2]);
+    this.voxelLightManager?.unregisterLight(pos[0], pos[1], pos[2]);
+
+    // 2. Update world state.
     this.worldService.setBlockOverride(pos[0], pos[1], pos[2], 0);
     this.noa.setBlock(0, pos[0], pos[1], pos[2]);
 
-    // Data-driven light teardown: if the destroyed block was a light source,
-    // remove it from the persistent registry. No hardcoded block IDs.
-    this.worldLightManager?.unregisterLight(pos[0], pos[1], pos[2]);
+    // 3. Relight + recolor immediately. DO NOT invalidate the base color cache
+    //    here — invalidating captures the CURRENT (already-lit) vertex colors
+    //    as the new "base," causing compounding drift on each place/break cycle.
+    //    The cached base (noa's original matColor × AO) is still valid for the
+    //    OLD mesh. When noa remeshes on the next tick, it creates a NEW mesh
+    //    with no cache → recolorMesh captures fresh noa base colors automatically.
+    const sc = this.getSceneSafe();
+    this.voxelLightManager?.relightAround(sc, pos[0], pos[1], pos[2]);
 
     const blockDef = this.blockService.getBlock(blockId);
     const event: GameEvent = {
@@ -1379,18 +1306,26 @@ export class NoaEngineAdapter {
 
     AudioService.getInstance().playBlockPlace();
 
-    this.worldService.setBlockOverride(adjacent[0], adjacent[1], adjacent[2], currentSelected);
-    this.noa.setBlock(currentSelected, adjacent[0], adjacent[1], adjacent[2]);
-
-    // Data-driven light registration: if the placed block is a light source
-    // (has tags.light_source OR a light profile), WorldLightManager will
-    // register it. No hardcoded block IDs.
+    // 1. Register light sources BEFORE setBlock (so relight seeds from the
+    //    new block correctly).
     const blockDef = this.blockService.getBlock(currentSelected);
     if (blockDef) {
       this.worldLightManager?.registerLight(
         adjacent[0], adjacent[1], adjacent[2], blockDef
       );
+      this.voxelLightManager?.registerLight(
+        adjacent[0], adjacent[1], adjacent[2], blockDef
+      );
     }
+
+    // 2. Update world state.
+    this.worldService.setBlockOverride(adjacent[0], adjacent[1], adjacent[2], currentSelected);
+    this.noa.setBlock(currentSelected, adjacent[0], adjacent[1], adjacent[2]);
+
+    // 3. Relight + recolor immediately. DO NOT invalidate the base color cache
+    //    (see handleLeftClickFire for explanation — invalidating causes drift).
+    const sc = this.getSceneSafe();
+    this.voxelLightManager?.relightAround(sc, adjacent[0], adjacent[1], adjacent[2]);
 
     const event: GameEvent = {
       type: GameEventType.BLOCK_PLACED,
@@ -1426,21 +1361,6 @@ export class NoaEngineAdapter {
       const dtMs = Math.min(250, now - this.lastFrameTime); // clamp huge spikes
       this.lastFrameTime = now;
 
-      // FPS + chunks-per-sec diagnostics for F3.
-      this.frameCount++;
-      const fpsElapsed = now - this.lastFpsTime;
-      if (fpsElapsed >= 500) {
-        this.fps = Math.round(((this.frameCount - this.lastFpsFrameCount) * 1000) / fpsElapsed);
-        this.lastFpsFrameCount = this.frameCount;
-        this.lastFpsTime = now;
-      }
-      const cpsNow = Date.now();
-      if (cpsNow - this.lastChunksPerSecTime >= 1000) {
-        this.chunksPerSec = this.chunksThisWindow;
-        this.chunksThisWindow = 0;
-        this.lastChunksPerSecTime = cpsNow;
-      }
-
       // Advance the master day/night clock (frame-rate independent).
       // Respect visual tuning: freeze time and speed multiplier.
       if (!this.visualTuning.timeFrozen) {
@@ -1466,6 +1386,27 @@ export class NoaEngineAdapter {
       // Update active dynamic lights (cull far, animate flicker/pulse).
       this.worldLightManager?.update(pos);
 
+      // Voxel light: process the cross-chunk relight queue (a few per tick to
+      // spread cost) + update the sky-light time-of-day multiplier. The sky
+      // multiplier is a CHEAP global tint — no full-world relight needed when
+      // time-of-day changes, just a brightness curve on the baked sky light.
+      //
+      // FIX: processRelightQueue now returns the list of processed chunk keys
+      // so we can recolor their visible meshes immediately. Previously it only
+      // returned a count — the adapter had no way to know WHICH chunks to
+      // recolor, so processed chunks stayed visually stale until noa remeshed.
+      const relightResult = this.voxelLightManager?.processRelightQueue(2);
+      if (relightResult && relightResult.count > 0 && relightResult.processedChunks.length > 0) {
+        const sc2 = this.getSceneSafe();
+        if (sc2) {
+          this.voxelLightManager?.recolorAffectedMeshes(sc2, relightResult.processedChunks);
+        }
+      }
+      // Sky light time multiplier: 1 at noon, 0 at midnight, smooth curve.
+      const sunAlt = sky.sunAltitude;
+      const skyTimeMult = Math.max(0, sunAlt > 0 ? Math.sqrt(sunAlt) : 0);
+      this.voxelLightManager?.setSkyLightTimeMultiplier(skyTimeMult);
+
       // Throttled player-position-derived updates (HUD, mission, audio).
       const nowMs = Date.now();
       if (nowMs - this.lastPositionUpdate > 120) {
@@ -1488,6 +1429,7 @@ export class NoaEngineAdapter {
             this.noa.setBlock(0, ruinCenter[0], ruinCenter[1], ruinCenter[2]);
             this.worldService.setBlockOverride(ruinCenter[0], ruinCenter[1], ruinCenter[2], 0);
             this.worldLightManager?.unregisterLight(ruinCenter[0], ruinCenter[1], ruinCenter[2]);
+            this.voxelLightManager?.unregisterLight(ruinCenter[0], ruinCenter[1], ruinCenter[2]);
             AudioService.getInstance().playArtifactPickup();
           }
         });
@@ -1517,20 +1459,12 @@ export class NoaEngineAdapter {
 
   /**
    * Resolve the visual preset for the current biome + sun altitude, merge any
-   * mod sky overlays (ONLY when explicitly enabled), apply VisualTuning live
-   * overrides, and apply to the scene + pipeline.
+   * mod sky overlays, apply VisualTuning live overrides, and apply to the
+   * scene + pipeline.
    *
-   * SKY OVERLAY AUDIT (this pass):
-   *   - The mod sky overlay is now OPT-IN. It only applies when
-   *     `visualTuning.useModSkyOverlay` is true AND a mod has registered sky
-   *     values. The old code merged it every frame, letting the legacy
-   *     example-ruins-pack/sky/sky.json purple values silently dominate.
-   *   - skyColor / fogColor sources are tracked and exposed via
-   *     __fpDebug().sky for F3.
-   *   - scene.ambientColor is now driven by the day/night cycle (was a constant
-   *     0.5,0.5,0.5 — the root cause of "night never gets dark" and "lamps
-   *     don't illuminate terrain").
-   *   - Test modes (Full Dark / Noon / Lamp Only) override lighting for QA.
+   * Pass 5: now applies real day/night brightness by scaling ambient + sun
+   * light intensities based on sun altitude. Previously only sky color
+   * changed, leaving terrain fullbright at night.
    */
   private applyAtmosphereForCurrentPhase(
     playerPos: [number, number, number],
@@ -1539,14 +1473,7 @@ export class NoaEngineAdapter {
     const scene = this.getSceneSafe();
     if (!scene) return;
 
-    // Keep the mod overlay flag in sync each frame (cheap).
-    this.syncModSkyOverlay();
-
     const [x, , z] = playerPos;
-    const inBlackGlass = this.worldService.isBlackGlassZone(x, z);
-    const biome: "red_wasteland" | "black_glass_canyon" = inBlackGlass
-      ? "black_glass_canyon"
-      : "red_wasteland";
 
     let altitude = sunAltitude;
     if (altitude === undefined) {
@@ -1554,37 +1481,28 @@ export class NoaEngineAdapter {
       altitude = Math.sin(angle);
     }
 
-    // Lighting phase label for F3.
-    if (altitude > 0.15) this.lightingPhase = "day";
-    else if (altitude > -0.15) this.lightingPhase = altitude >= 0 ? "dusk" : "dawn";
-    else this.lightingPhase = "night";
-
     const vt = this.visualTuning;
 
-    // ---- Resolve base preset (built-in) ----
-    let preset = resolveBiomePhasePreset(biome, altitude);
-    let resolvedSkyColor = preset.skyColor;
-    let resolvedFogColor = preset.fogColor;
-    this.skyColorSource = "built-in preset";
-    this.fogColorSource = "built-in preset";
+    // ---- ATMOSPHERE BIOME RESOLUTION (decoupled from black-glass terrain) ----
+    // atmosphereBiomeMode controls whether the global preset follows the biome.
+    // Default "fixed_red_wasteland" — black glass is just a surface block and
+    // does NOT change the sky. The old code snapped isBlackGlassZone→black sky.
+    const biomeMode = (vt as any).atmosphereBiomeMode ?? "fixed_red_wasteland";
+    let biome: "red_wasteland" | "black_glass_canyon" = "red_wasteland";
+    if (biomeMode === "manual_black_glass") {
+      biome = "black_glass_canyon";
+    } else if (biomeMode === "follow_biome") {
+      biome = this.worldService.isBlackGlassZone(x, z) ? "black_glass_canyon" : "red_wasteland";
+    }
 
-    // ---- Mod sky overlay (OPT-IN) ----
-    // Only merge mod values when the toggle is on. This is the fix for the
-    // "purple void" — the legacy example-ruins-pack/sky/sky.json no longer
-    // silently overrides the built-in presets.
-    if (this.modSkyOverlayActive) {
-      const merged = this.mergeModSkyOverlay(preset);
-      const reg = ModRegistry.getInstance();
-      const sources = reg.getActiveSkySources();
-      if (merged.skyColor !== preset.skyColor) {
-        resolvedSkyColor = merged.skyColor;
-        this.skyColorSource = `mod overlay (${sources.skyColor ?? sources.dayColor ?? sources.nightColor ?? 'unknown'})`;
-      }
-      if (merged.fogColor !== preset.fogColor) {
-        resolvedFogColor = merged.fogColor;
-        this.fogColorSource = `mod overlay (${sources.fogColor ?? 'unknown'})`;
-      }
-      preset = merged;
+    let preset = resolveBiomePhasePreset(biome, altitude);
+
+    // ---- Mod sky overlay (OPT-IN, default OFF) ----
+    // The old code merged the purple example-ruins-pack/sky/sky.json every frame.
+    // Now it only applies when useModSkyOverlay is true. This kills the Purple Dimension.
+    const useModOverlay = (vt as any).useModSkyOverlay === true;
+    if (useModOverlay) {
+      preset = this.mergeModSkyOverlay(preset);
     }
 
     if (vt.fogAutoClampToRenderDistance) {
@@ -1592,86 +1510,51 @@ export class NoaEngineAdapter {
     }
 
     // ---- Fog + ClearColor ----
-    // When sky is isolated (Isolate Sky debug mode), SKIP the per-frame
-    // fog/clearColor apply so the isolate state (dark navy clearColor, fog off)
-    // persists. isolateSky() manages these directly.
-    if (!this.skyIsolated) {
-      scene.fogEnabled = vt.fogEnabled;
-      scene.fogMode = BABYLON.Scene.FOGMODE_LINEAR;
-      if (vt.fogColorHex) {
-        scene.fogColor = parseHexColor3(vt.fogColorHex, new BABYLON.Color3(0.3, 0.2, 0.3));
-        this.fogColorSource = "debug override";
-        this.activeFogColorHex = vt.fogColorHex;
-      } else {
-        scene.fogColor = parseHexColor3(resolvedFogColor, new BABYLON.Color3(0.3, 0.2, 0.3));
-        this.activeFogColorHex = resolvedFogColor;
-      }
-      scene.fogStart = vt.fogStart !== null ? vt.fogStart : preset.fogStart;
-      scene.fogEnd = vt.fogEnd !== null ? vt.fogEnd : preset.fogEnd;
-      if (scene.fogStart >= scene.fogEnd) {
-        scene.fogStart = Math.max(20, scene.fogEnd - 40);
-      }
-
-      // ClearColor (sky background) — separate from sky meshes.
-      if (vt.clearColorOverrideHex) {
-        scene.clearColor = parseHexColor4(
-          vt.clearColorOverrideHex,
-          new BABYLON.Color4(0.05, 0.03, 0.08, 1.0)
-        );
-        this.skyColorSource = "debug override (clearColor)";
-        this.activeSkyColorHex = vt.clearColorOverrideHex;
-      } else {
-        scene.clearColor = parseHexColor4(
-          resolvedSkyColor,
-          new BABYLON.Color4(0.05, 0.03, 0.08, 1.0)
-        );
-        this.activeSkyColorHex = resolvedSkyColor;
-      }
-    } else {
-      this.skyColorSource = "isolate sky (debug)";
-      this.activeSkyColorHex = "#03030A";
-      this.fogColorSource = "isolate sky (debug)";
-      this.activeFogColorHex = "#03030A";
+    scene.fogEnabled = vt.fogEnabled;
+    scene.fogMode = BABYLON.Scene.FOGMODE_LINEAR;
+    scene.fogColor = vt.fogColorHex
+      ? parseHexColor3(vt.fogColorHex, new BABYLON.Color3(0.3, 0.2, 0.3))
+      : parseHexColor3(preset.fogColor, new BABYLON.Color3(0.3, 0.2, 0.3));
+    scene.clearColor = parseHexColor4(
+      preset.skyColor,
+      new BABYLON.Color4(0.05, 0.03, 0.08, 1.0)
+    );
+    scene.fogStart = vt.fogStart !== null ? vt.fogStart : preset.fogStart;
+    scene.fogEnd = vt.fogEnd !== null ? vt.fogEnd : preset.fogEnd;
+    if (scene.fogStart >= scene.fogEnd) {
+      scene.fogStart = Math.max(20, scene.fogEnd - 40);
     }
 
     // ---- Real day/night brightness ----
-    // altitude: -1 (midnight) .. 0 (horizon) .. +1 (noon)
-    const dayT = Math.max(0, altitude); // 0 at night, 1 at noon
-    const nightT = Math.max(0, -altitude); // 0 at day, 1 at midnight
+    const dayT = Math.max(0, altitude);
+    const nightT = Math.max(0, -altitude);
 
-    let ambientIntensity =
+    const ambientIntensity =
       (vt.dayAmbientIntensity * dayT + vt.nightAmbientIntensity * (1 - dayT)) *
       vt.ambientIntensityMultiplier;
-    let sunIntensity =
+    const sunIntensity =
       (altitude > 0
         ? vt.noonSunIntensity * Math.sqrt(altitude)
         : vt.midnightSunIntensity) * vt.sunIntensityMultiplier;
 
-    // ---- Test modes override lighting ----
-    if (this.fullDarkTestActive) {
-      ambientIntensity = 0.0;
-      sunIntensity = 0.0;
-    } else if (this.noonLightingTestActive) {
-      ambientIntensity = vt.dayAmbientIntensity * vt.ambientIntensityMultiplier;
-      sunIntensity = vt.noonSunIntensity * vt.sunIntensityMultiplier;
-    } else if (this.lampOnlyTestActive) {
-      ambientIntensity = 0.0;
-      sunIntensity = 0.0;
-    }
-
-    // ---- Drive scene.ambientColor from the day/night cycle ----
-    // THIS is the key fix: noa sets scene.ambientColor=(0.5,0.5,0.5) at boot
-    // and the old code never changed it. With material.ambientColor=(1,1,1),
-    // that produced a constant 0.5 fill that prevented night from ever getting
-    // dark and drowned out placed dynamic lights. Now we interpolate between
-    // nightSceneAmbient (low) and daySceneAmbient (higher), tinted by the
-    // preset's ambientColor, and scaled by the multiplier + test modes.
-    const sceneAmbientBrightness =
-      (this.fullDarkTestActive || this.lampOnlyTestActive)
-        ? 0.0
-        : this.noonLightingTestActive
-        ? vt.daySceneAmbient
-        : (vt.daySceneAmbient * dayT + vt.nightSceneAmbient * nightT) * vt.sceneAmbientMultiplier;
+    // ---- Drive scene.ambientColor from day/night (was constant 0.5 → night never dark) ----
+    // VOXEL-LIGHT-REPAIR: in performance_voxel mode, terrain materials now
+    // have disableLighting=true, so scene.ambientColor is NOT the primary
+    // terrain driver (vertex colors are). But we still apply a floor (~0.15)
+    // so non-terrain meshes (sky bodies, water, entities) and any lit-mode
+    // fallback materials remain visible at night. The primary night-darkness
+    // fix is the unlit terrain materials + the voxel light's skyLight ×
+    // timeMultiplier baked into vertex colors.
+    const daySceneAmbient = (vt as any).daySceneAmbient ?? 0.45;
+    const nightSceneAmbient = (vt as any).nightSceneAmbient ?? 0.20;
+    const sceneAmbientMult = (vt as any).sceneAmbientMultiplier ?? 1.0;
+    const sceneAmbientBrightnessRaw =
+      (daySceneAmbient * dayT + nightSceneAmbient * nightT) * sceneAmbientMult;
+    // Floor: never let scene ambient go below 0.25 so the scene isn't pitch
+    // black for non-terrain meshes (sky meshes, entities, etc). With unlit
+    // terrain (disableLighting=true) this floor is a fallback, not the primary
+    // terrain driver — but it keeps the sky/sun/moon meshes visible.
+    const sceneAmbientBrightness = Math.max(0.25, sceneAmbientBrightnessRaw);
     const [ar, ag, ab] = preset.ambientColor;
     scene.ambientColor = new BABYLON.Color3(
       ar * sceneAmbientBrightness,
@@ -1679,42 +1562,48 @@ export class NoaEngineAdapter {
       ab * sceneAmbientBrightness
     );
 
-    // ---- Apply sun + ambient + moon light intensities ----
+    // ---- Sun + ambient + moon light intensities ----
+    // IMPORTANT: dynamicLightsEnabled controls ONLY WorldLightManager real
+    // PointLights. It must NOT disable the sun/moon/ambient — those are the
+    // day/night system and are independent. The old code gated sunLight.intensity
+    // on vt.dynamicLightsEnabled, which turned off the sun when you toggled
+    // dynamic lights off. Fixed.
     if (this.skyController) {
       const sunLight = this.skyController.getSunLight();
       if (sunLight) {
-        sunLight.intensity = (this.lampOnlyTestActive || this.fullDarkTestActive)
-          ? 0
-          : (vt.dynamicLightsEnabled !== false ? sunIntensity : 0);
+        sunLight.intensity = sunIntensity;
       }
       const ambient = this.skyController.getAmbientLight();
       if (ambient) {
         ambient.intensity = ambientIntensity;
       }
-      // Moon light: driven by night factor unless a test mode suppresses it.
-      const moonNight = this.lampOnlyTestActive || this.fullDarkTestActive ? 0 : nightT;
       const moonLight = this.skyController.getMoonLight();
       if (moonLight) {
-        moonLight.intensity = vt.moonLightEnabled ? vt.moonLightIntensity * moonNight : 0;
+        const moonEnabled = (vt as any).moonLightEnabled !== false;
+        const moonInt = (vt as any).moonLightIntensity ?? 0.25;
+        moonLight.intensity = moonEnabled ? moonInt * nightT : 0;
       }
     }
 
-    // ---- Apply glow/bloom/postprocess overrides ----
-    // Lamp Only Test: force glow/bloom OFF so only dynamic lights show.
-    if (this.lampOnlyTestActive) {
-      this.renderPipelineService?.setGlowEnabled(false);
-      this.renderPipelineService?.setBloomEnabled(false);
-    } else {
-      this.renderPipelineService?.setGlowEnabled(vt.glowEnabled);
-      if (vt.glowEnabled) {
-        this.renderPipelineService?.setGlowIntensity(vt.glowIntensity);
-      }
-      this.renderPipelineService?.setBloomEnabled(vt.bloomEnabled);
+    // ---- Dynamic lights (WorldLightManager) — controlled by dynamicLightsEnabled ----
+    if (this.worldLightManager) {
+      this.worldLightManager.setEnabled(vt.dynamicLightsEnabled);
     }
+
+    // ---- Voxel light sky-time multiplier ----
+    const skyTimeMult = Math.max(0, altitude > 0 ? Math.sqrt(altitude) : 0);
+    this.voxelLightManager?.setSkyLightTimeMultiplier(skyTimeMult);
+
+    // ---- Apply glow/bloom/postprocess overrides ----
+    this.renderPipelineService?.setGlowEnabled(vt.glowEnabled);
+    if (vt.glowEnabled) {
+      this.renderPipelineService?.setGlowIntensity(vt.glowIntensity);
+    }
+    this.renderPipelineService?.setBloomEnabled(vt.bloomEnabled);
     this.renderPipelineService?.setExposure(vt.exposure);
     this.renderPipelineService?.setContrast(vt.contrast);
 
-    // ---- Apply sky visibility overrides (respects master meshesEnabled) ----
+    // ---- Apply sky visibility overrides ----
     this.skyController?.setVisibilityOverrides({
       sunVisible: vt.sunVisible,
       moonVisible: vt.moonVisible,
@@ -1723,21 +1612,17 @@ export class NoaEngineAdapter {
       starBrightness: vt.starBrightness,
     });
 
-    // ---- Apply terrain material mode (only on change, not every frame) ----
-    if (vt.terrainMaterialMode !== this.currentTerrainMaterialMode) {
-      if (vt.terrainMaterialMode === "debug") {
-        this.applyTerrainDebugMaterial(true);
-      } else {
-        this.applyTerrainDebugMaterial(false);
-      }
-      this.currentTerrainMaterialMode = vt.terrainMaterialMode;
+    // ---- Apply terrain material mode ----
+    if (vt.terrainMaterialMode === "debug") {
+      this.applyTerrainDebugMaterial(true);
+    } else {
+      this.applyTerrainDebugMaterial(false);
     }
   }
 
   /**
    * Merge mod sky overlays (ModRegistry.getActiveSky) on top of a base preset.
-   * Only called when `modSkyOverlayActive` is true (opt-in). Returns the merged
-   * preset; the caller tracks which fields changed for source labeling.
+   * Mod values are advisory; clampPreset() still enforces hard safety floors.
    */
   private mergeModSkyOverlay(base: import('./rendering/visual-presets').VisualPreset) {
     const skyMod = ModRegistry.getInstance().getActiveSky();
@@ -1819,6 +1704,291 @@ export class NoaEngineAdapter {
 
   public getWorldLightManager(): WorldLightManager | null {
     return this.worldLightManager;
+  }
+
+  // ---- CHUNK GRID VISUALIZATION ----
+  private chunkGridLines: BABYLON.LinesMesh | null = null;
+  private chunkGridHighlight: BABYLON.LinesMesh | null = null;
+
+  public buildChunkGrid(scene: BABYLON.Scene): void {
+    this.removeChunkGrid(scene);
+    const pp = this.getPlayerPositionSafe() || [0, 15, 0];
+    const px = Math.floor(pp[0]), py = Math.floor(pp[1]), pz = Math.floor(pp[2]);
+    const range = 48; // 3 chunks in each direction
+    const lines: BABYLON.Vector3[] = [];
+    const colors: BABYLON.Color4[] = [];
+    const gridColor = new BABYLON.Color4(0, 0.6, 0.6, 0.3); // dim cyan
+    const playerColor = new BABYLON.Color4(0, 1, 1, 0.8); // bright cyan
+    const affectedColor = new BABYLON.Color4(1, 1, 0, 0.6); // yellow
+    // X lines (along Z at each X=16k)
+    for (let x = px - range; x <= px + range; x += 16) {
+      const isPlayerLine = Math.floor(x / 16) === Math.floor(px / 16);
+      const c = isPlayerLine ? playerColor : gridColor;
+      lines.push(new BABYLON.Vector3(x, py - 2, pz - range), new BABYLON.Vector3(x, py - 2, pz + range));
+      colors.push(c, c);
+    }
+    // Z lines (along X at each Z=16k)
+    for (let z = pz - range; z <= pz + range; z += 16) {
+      const isPlayerLine = Math.floor(z / 16) === Math.floor(pz / 16);
+      const c = isPlayerLine ? playerColor : gridColor;
+      lines.push(new BABYLON.Vector3(px - range, py - 2, z), new BABYLON.Vector3(px + range, py - 2, z));
+      colors.push(c, c);
+    }
+    // Highlight affected chunks
+    const affectedKeys = this.voxelLightManager?.getLastAffectedChunkKeys() ?? [];
+    for (const key of affectedKeys) {
+      const [acx, , acz] = key.split(",").map(Number);
+      const ox = acx * 16, oz = acz * 16;
+      const c = affectedColor;
+      lines.push(
+        new BABYLON.Vector3(ox, py - 2, oz), new BABYLON.Vector3(ox + 16, py - 2, oz),
+        new BABYLON.Vector3(ox + 16, py - 2, oz), new BABYLON.Vector3(ox + 16, py - 2, oz + 16),
+        new BABYLON.Vector3(ox + 16, py - 2, oz + 16), new BABYLON.Vector3(ox, py - 2, oz + 16),
+        new BABYLON.Vector3(ox, py - 2, oz + 16), new BABYLON.Vector3(ox, py - 2, oz),
+      );
+      for (let i = 0; i < 8; i++) colors.push(c);
+    }
+    this.chunkGridLines = BABYLON.MeshBuilder.CreateLines("fp_chunk_grid", { points: lines, colors }, scene);
+    this.chunkGridLines.isPickable = false;
+    this.chunkGridLines.alwaysSelectAsActiveMesh = true;
+    // Register with octree
+    const octMgr = (this.noa.rendering as any)?._octreeManager;
+    if (octMgr && typeof octMgr.addMesh === "function") octMgr.addMesh(this.chunkGridLines, false);
+    console.log(`[NoaEngineAdapter] Chunk grid ON: ${lines.length / 2} lines, ${affectedKeys.length} affected chunks highlighted.`);
+  }
+
+  public removeChunkGrid(scene: BABYLON.Scene): void {
+    if (this.chunkGridLines) {
+      this.chunkGridLines.dispose();
+      this.chunkGridLines = null;
+    }
+    if (this.chunkGridHighlight) {
+      this.chunkGridHighlight.dispose();
+      this.chunkGridHighlight = null;
+    }
+  }
+
+  // ---- WAIT FOR VISIBLE MESHES ----
+  private async waitForVisibleMeshesAround(pos: [number, number, number], timeoutMs: number = 5000): Promise<number> {
+    const sc = this.getSceneSafe();
+    if (!sc) return 0;
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      let count = 0;
+      for (const m of sc.meshes) {
+        if (!m.name || !m.name.startsWith || !m.name.startsWith("chunk_")) continue;
+        if (!m.isEnabled()) continue;
+        const dx = m.position.x - pos[0];
+        const dz = m.position.z - pos[2];
+        if (dx * dx + dz * dz < 32 * 32) count++;
+      }
+      if (count > 0) return count;
+      await new Promise(r => setTimeout(r, 200));
+    }
+    return 0;
+  }
+
+  // ---- LIGHT SWEEP TEST ----
+  public async runLightSweep(direction: "+X" | "-X" | "+Z" | "-Z" | "diag"): Promise<any[]> {
+    const sc = this.getSceneSafe();
+    if (!sc) return [{ error: "no scene" }];
+    const vlm = this.voxelLightManager;
+    if (!vlm) return [{ error: "no vlm" }];
+    const positions: number[] = [0, 5, 10, 15, 16, 20, 25, 30, 32, 40, 48, 64, 80];
+    const results: any[] = [];
+    const bd = this.blockService.getBlock(7); // yellow halogen
+    if (!bd) return [{ error: "no block def for id 7" }];
+
+    for (const dist of positions) {
+      let lx: number, lz: number;
+      if (direction === "+X") { lx = dist; lz = 0; }
+      else if (direction === "-X") { lx = -dist; lz = 0; }
+      else if (direction === "+Z") { lx = 0; lz = dist; }
+      else if (direction === "-Z") { lx = 0; lz = -dist; }
+      else { lx = dist; lz = dist; } // diag
+
+      // Find ground level
+      let ly = 14;
+      for (let y = 20; y > 0; y--) {
+        if (this.getBlockIdAt(lx, y, lz) !== 0) { ly = y + 1; break; }
+      }
+
+      // Teleport player
+      const eng = this.noa;
+      eng.entities.setPosition(eng.playerEntity, [lx, ly + 2, lz]);
+
+      // Wait for visible meshes
+      const visibleMeshes = await this.waitForVisibleMeshesAround([lx, ly, lz], 3000);
+
+      // Record brightness before
+      const brightBefore = vlm.brightnessAtSurface(lx, ly, lz);
+
+      // Place light
+      this.worldService.setBlockOverride(lx, ly, lz, 7);
+      this.noa.setBlock(7, lx, ly, lz);
+      vlm.registerLight(lx, ly, lz, bd);
+      const sourceCountBefore = (vlm as any).voxelLightSources.size;
+      const result = vlm.relightAround(sc, lx, ly, lz);
+      const sourceCountAfter = (vlm as any).voxelLightSources.size;
+
+      // Check results
+      const brightAfter = vlm.brightnessAtSurface(lx, ly, lz);
+      const inspect = vlm.inspectLightingAt(lx, ly, lz);
+      const blockLightAtSource = inspect.blockLightR ?? 0;
+
+      // Remove light
+      this.worldService.setBlockOverride(lx, ly, lz, 0);
+      this.noa.setBlock(0, lx, ly, lz);
+      vlm.unregisterLight(lx, ly, lz);
+      vlm.relightAround(sc, lx, ly, lz);
+      const brightAfterRemove = vlm.brightnessAtSurface(lx, ly, lz);
+
+      const cx = Math.floor(lx / 16), cz = Math.floor(lz / 16);
+      const localX = lx - cx * 16, localZ = lz - cz * 16;
+      const isBoundary = localX === 0 || localX === 15 || localZ === 0 || localZ === 15;
+
+      const pass = blockLightAtSource > 0 && result.recoloredMeshCount > 0 && brightAfter[0] >= brightBefore[0];
+      const inconclusive = visibleMeshes === 0;
+
+      const stepResult = {
+        direction, stepIndex: positions.indexOf(dist), worldPos: [lx, ly, lz],
+        chunkKey: `${Math.floor(lx/16)},${Math.floor(ly/16)},${Math.floor(lz/16)}`,
+        localCell: [localX, ly % 16, localZ],
+        distFromSpawn: Math.sqrt(lx*lx + lz*lz),
+        isChunkBoundary: isBoundary,
+        visibleMeshesNearby: visibleMeshes,
+        sourceRegistered: sourceCountAfter > sourceCountBefore,
+        sourceCountBefore, sourceCountAfter,
+        affectedChunks: result.recomputedChunks.length,
+        recoloredMeshes: result.recoloredMeshCount,
+        blockLightAtSource,
+        brightnessBefore: brightBefore.map((v: number) => v.toFixed(3)),
+        brightnessAfter: brightAfter.map((v: number) => v.toFixed(3)),
+        brightnessAfterRemove: brightAfterRemove.map((v: number) => v.toFixed(3)),
+        result: inconclusive ? "INCONCLUSIVE" : pass ? "PASS" : "FAIL",
+      };
+      results.push(stepResult);
+      console.log(`[Sweep ${direction}] step ${stepResult.stepIndex}: pos=(${lx},${ly},${lz}) chunk=${stepResult.chunkKey} ${stepResult.result} meshes=${visibleMeshes} recolored=${result.recoloredMeshCount} blockLight=${blockLightAtSource}`);
+
+      if (!pass && !inconclusive) {
+        console.log("[Sweep] STOPPING at first failure:", JSON.stringify(stepResult, null, 2));
+        break;
+      }
+    }
+    // Return to spawn
+    this.noa.entities.setPosition(this.noa.playerEntity, [0, 15, 0]);
+    vlm.relightAround(sc, 0, 15, 0);
+    return results;
+  }
+
+  // ---- CHUNK BORDER TEST ----
+  public async runChunkBorderTest(): Promise<any[]> {
+    const sc = this.getSceneSafe();
+    if (!sc) return [{ error: "no scene" }];
+    const vlm = this.voxelLightManager;
+    if (!vlm) return [{ error: "no vlm" }];
+    const bd = this.blockService.getBlock(7);
+    if (!bd) return [{ error: "no block def" }];
+
+    // Test positions relative to chunk origin (0,0,0): before border, at border, after border
+    const testPositions = [
+      { x: 15, z: 0, label: "1-block before X border" },
+      { x: 16, z: 0, label: "at X border (chunk 1)" },
+      { x: 17, z: 0, label: "1-block after X border" },
+      { x: 0, z: 15, label: "1-block before Z border" },
+      { x: 0, z: 16, label: "at Z border (chunk 1)" },
+      { x: 0, z: 17, label: "1-block after Z border" },
+      { x: 15, z: 15, label: "corner before both borders" },
+      { x: 16, z: 16, label: "corner at both borders" },
+    ];
+
+    const results: any[] = [];
+    for (const tp of testPositions) {
+      // Find ground
+      let ly = 14;
+      for (let y = 20; y > 0; y--) {
+        if (this.getBlockIdAt(tp.x, y, tp.z) !== 0) { ly = y + 1; break; }
+      }
+      const brightBefore = vlm.brightnessAtSurface(tp.x, ly, tp.z);
+      this.worldService.setBlockOverride(tp.x, ly, tp.z, 7);
+      this.noa.setBlock(7, tp.x, ly, tp.z);
+      vlm.registerLight(tp.x, ly, tp.z, bd);
+      const result = vlm.relightAround(sc, tp.x, ly, tp.z);
+      const brightAfter = vlm.brightnessAtSurface(tp.x, ly, tp.z);
+      const inspect = vlm.inspectLightingAt(tp.x, ly, tp.z);
+
+      // Remove
+      this.worldService.setBlockOverride(tp.x, ly, tp.z, 0);
+      this.noa.setBlock(0, tp.x, ly, tp.z);
+      vlm.unregisterLight(tp.x, ly, tp.z);
+      vlm.relightAround(sc, tp.x, ly, tp.z);
+      const brightAfterRemove = vlm.brightnessAtSurface(tp.x, ly, tp.z);
+
+      const pass = inspect.blockLightR > 0 && result.recoloredMeshCount > 0;
+      const r = {
+        label: tp.label, worldPos: [tp.x, ly, tp.z],
+        chunkKey: `${Math.floor(tp.x/16)},${Math.floor(ly/16)},${Math.floor(tp.z/16)}`,
+        brightBefore: brightBefore.map((v: number) => v.toFixed(3)),
+        brightAfter: brightAfter.map((v: number) => v.toFixed(3)),
+        brightAfterRemove: brightAfterRemove.map((v: number) => v.toFixed(3)),
+        blockLightAtSource: inspect.blockLightR ?? 0,
+        affectedChunks: result.recomputedChunks.length,
+        recoloredMeshes: result.recoloredMeshCount,
+        result: pass ? "PASS" : "FAIL",
+      };
+      results.push(r);
+      console.log(`[BorderTest] ${tp.label}: ${r.result} blockLight=${inspect.blockLightR} recolored=${result.recoloredMeshCount}`);
+    }
+    return results;
+  }
+
+  // ---- RUIN STRESS TEST ----
+  public async runRuinStressTest(): Promise<any> {
+    const sc = this.getSceneSafe();
+    if (!sc) return { error: "no scene" };
+    const vlm = this.voxelLightManager;
+    if (!vlm) return { error: "no vlm" };
+    const ruin = this.worldService.getRuinCenter();
+    // Teleport
+    this.noa.entities.setPosition(this.noa.playerEntity, [ruin[0] + 2, ruin[1] + 2, ruin[2] + 2]);
+    await this.waitForVisibleMeshesAround([ruin[0], ruin[1], ruin[2]], 3000);
+    vlm.forceRelightAllImmediate(sc);
+
+    const sourcesBefore = (vlm as any).voxelLightSources.size;
+    const inspectBefore = vlm.inspectLightingAt(ruin[0], ruin[1], ruin[2]);
+
+    // Place + remove cyan lamp 5x
+    const bd = this.blockService.getBlock(6);
+    let stressPass = true;
+    if (bd) {
+      for (let i = 0; i < 5; i++) {
+        const px = ruin[0] + 3, py = ruin[1], pz = ruin[2] + 3;
+        this.worldService.setBlockOverride(px, py, pz, 6);
+        this.noa.setBlock(6, px, py, pz);
+        vlm.registerLight(px, py, pz, bd);
+        vlm.relightAround(sc, px, py, pz);
+        this.worldService.setBlockOverride(px, py, pz, 0);
+        this.noa.setBlock(0, px, py, pz);
+        vlm.unregisterLight(px, py, pz);
+        vlm.relightAround(sc, px, py, pz);
+      }
+    }
+    const sourcesAfter = (vlm as any).voxelLightSources.size;
+    const inspectAfter = vlm.inspectLightingAt(ruin[0], ruin[1], ruin[2]);
+    const vl = (window as any).__fpDebug().voxelLighting;
+
+    return {
+      ruinCenter: ruin,
+      sourcesBefore, sourcesAfter,
+      sourcesStable: sourcesBefore === sourcesAfter,
+      inspectBefore: { sky: inspectBefore.skyLight, blockR: inspectBefore.blockLightR },
+      inspectAfter: { sky: inspectAfter.skyLight, blockR: inspectAfter.blockLightR },
+      realPointLights: vl.realPointLightsActive,
+      invalidColors: vl.invalidColorWriteCount,
+      registeredSources: vl.registeredVoxelSources,
+      stressCycles: 5,
+      pass: sourcesBefore === sourcesAfter && vl.realPointLightsActive === 0 && vl.invalidColorWriteCount === 0,
+    };
   }
 
   public destroy(): void {

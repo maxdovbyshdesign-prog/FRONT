@@ -54,8 +54,11 @@ export interface GraphicsSettings {
 
 const PRESETS: Record<GraphicsQuality, Omit<GraphicsSettings, "quality">> = {
   low: {
-    maxActiveDynamicLights: 4,
-    glowIntensity: 0.10,
+    // PERFORMANCE-FIRST: real PointLights capped to 3 (debug only). Primary
+    // lighting is VoxelLightManager (baked vertex colors). maxSimultaneousLights
+    // on terrain materials is 4 — sun+moon+ambient+1 spare, no per-block lights.
+    maxActiveDynamicLights: 3,
+    glowIntensity: 0.08,
     bloomEnabled: false,
     bloomKernel: 16,
     bloomWeight: 0.2,
@@ -67,11 +70,11 @@ const PRESETS: Record<GraphicsQuality, Omit<GraphicsSettings, "quality">> = {
     cloudCount: 0,
     fxaaEnabled: true,
     glowKernel: 16,
-    maxSimultaneousLightsCap: 6,
+    maxSimultaneousLightsCap: 4,
   },
   medium: {
-    maxActiveDynamicLights: 6,
-    glowIntensity: 0.15,
+    maxActiveDynamicLights: 3,
+    glowIntensity: 0.10,
     bloomEnabled: false,
     bloomKernel: 24,
     bloomWeight: 0.25,
@@ -83,11 +86,11 @@ const PRESETS: Record<GraphicsQuality, Omit<GraphicsSettings, "quality">> = {
     cloudCount: 0,
     fxaaEnabled: true,
     glowKernel: 20,
-    maxSimultaneousLightsCap: 8,
+    maxSimultaneousLightsCap: 4,
   },
   high: {
-    maxActiveDynamicLights: 8,
-    glowIntensity: 0.20,
+    maxActiveDynamicLights: 3,
+    glowIntensity: 0.12,
     bloomEnabled: false,
     bloomKernel: 32,
     bloomWeight: 0.3,
@@ -99,7 +102,7 @@ const PRESETS: Record<GraphicsQuality, Omit<GraphicsSettings, "quality">> = {
     cloudCount: 0,
     fxaaEnabled: true,
     glowKernel: 24,
-    maxSimultaneousLightsCap: 8,
+    maxSimultaneousLightsCap: 4,
   },
 };
 

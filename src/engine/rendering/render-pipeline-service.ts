@@ -27,9 +27,6 @@ export class RenderPipelineService {
   private glowLayer: BABYLON.GlowLayer | null = null;
   private pipeline: BABYLON.DefaultRenderingPipeline | null = null;
   private disposed = false;
-  /** Track current states so repeated calls (every frame) don't spam logs. */
-  private glowEnabledCurrent: boolean | null = null;
-  private bloomEnabledCurrent: boolean | null = null;
 
   constructor(
     scene: BABYLON.Scene,
@@ -80,77 +77,14 @@ export class RenderPipelineService {
    * rest.
    */
   private initDefaultPipeline(): void {
-    if (!this.camera) {
-      console.warn(
-        "[RenderPipelineService] No camera available; skipping DefaultRenderingPipeline."
-      );
-      return;
-    }
-    if (!this.settings.bloomEnabled && !this.settings.toneMappingEnabled) {
-      console.log(
-        "[RenderPipelineService] Bloom + tone mapping disabled by quality preset."
-      );
-      return;
-    }
-
-    try {
-      this.pipeline = new BABYLON.DefaultRenderingPipeline(
-        "fp_pipeline",
-        this.settings.toneMappingEnabled, // HDR mode required for tone mapping
-        this.scene,
-        [this.camera]
-      );
-    } catch (e) {
-      console.warn(
-        "[RenderPipelineService] DefaultRenderingPipeline init failed — continuing with GlowLayer only:",
-        e
-      );
-      this.pipeline = null;
-      return;
-    }
-
-    try {
-      // Bloom — keep it SUBTLE. The frontier is lonely, not a rave.
-      this.pipeline.bloomEnabled = this.settings.bloomEnabled;
-      if (this.settings.bloomEnabled) {
-        this.pipeline.bloomKernel = this.settings.bloomKernel;
-        this.pipeline.bloomWeight = this.settings.bloomWeight;
-        this.pipeline.bloomThreshold = this.settings.bloomThreshold;
-        this.pipeline.bloomScale = 0.5;
-      }
-    } catch (e) {
-      console.warn("[RenderPipelineService] Bloom config failed:", e);
-    }
-
-    try {
-      // Image processing (exposure / contrast / tone mapping).
-      const ip = this.pipeline.imageProcessing;
-      ip.exposure = this.settings.exposure;
-      ip.contrast = this.settings.contrast;
-      if (this.settings.toneMappingEnabled) {
-        ip.toneMappingEnabled = true;
-        ip.toneMappingType =
-          BABYLON.ImageProcessingConfiguration.TONEMAPPING_ACES;
-      }
-    } catch (e) {
-      console.warn("[RenderPipelineService] ImageProcessing config failed:", e);
-    }
-
-    try {
-      // FXAA — cheap, safe, always on when pipeline exists.
-      this.pipeline.fxaaEnabled = this.settings.fxaaEnabled;
-    } catch (e) {
-      console.warn("[RenderPipelineService] FXAA config failed:", e);
-    }
-
-    // Sharpening is intentionally OFF — it over-crisps voxel edges.
-    try {
-      this.pipeline.sharpenEnabled = false;
-    } catch {
-      /* ignore */
-    }
-
-    console.log("[RenderPipelineService] DefaultRenderingPipeline configured.");
+    // PERFORMANCE VOXEL MODE: Skip DefaultRenderingPipeline entirely.
+    // The pipeline (HDR or LDR) applies image processing that darkens the
+    // unlit vertex colors. With disableLighting=true terrain materials,
+    // vertex colors ARE the final intended color. Any pipeline processing
+    // (tone mapping, exposure, contrast, gamma) only corrupts them.
+    // GlowLayer is initialized separately in initGlowLayer().
+    console.log("[RenderPipelineService] Pipeline SKIPPED (performance voxel). Vertex colors = final output.");
+    return;
   }
 
   /**
@@ -191,12 +125,9 @@ export class RenderPipelineService {
   }
 
   /**
-   * Toggle GlowLayer on/off at runtime (QA debug). Idempotent: skips work + log
-   * when the value hasn't changed (called every frame by applyAtmosphere).
+   * Toggle GlowLayer on/off at runtime (QA debug).
    */
   public setGlowEnabled(enabled: boolean): void {
-    if (this.glowEnabledCurrent === enabled) return;
-    this.glowEnabledCurrent = enabled;
     try {
       if (this.glowLayer) {
         this.glowLayer.intensity = enabled ? this.settings.glowIntensity : 0;
@@ -208,11 +139,9 @@ export class RenderPipelineService {
   }
 
   /**
-   * Toggle bloom on/off at runtime (QA debug). Idempotent.
+   * Toggle bloom on/off at runtime (QA debug).
    */
   public setBloomEnabled(enabled: boolean): void {
-    if (this.bloomEnabledCurrent === enabled) return;
-    this.bloomEnabledCurrent = enabled;
     try {
       if (this.pipeline) {
         this.pipeline.bloomEnabled = enabled;
@@ -286,10 +215,6 @@ export class RenderPipelineService {
     } catch {
       /* ignore */
     }
-    // Reset idempotency trackers so the next setGlowEnabled/setBloomEnabled
-    // re-applies after a pipeline rebuild.
-    this.glowEnabledCurrent = null;
-    this.bloomEnabledCurrent = null;
   }
 
   public dispose(): void {

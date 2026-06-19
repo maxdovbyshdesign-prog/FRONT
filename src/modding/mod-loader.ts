@@ -166,10 +166,7 @@ export class ModLoader {
           const skyResp = await fetch(skyUrl);
           if (skyResp.ok) {
             const skyConfig: ModSkyConfig = await skyResp.json();
-            // Pass the mod folder + file path as the source so F3 can label
-            // exactly which config supplied the active overlay. The overlay is
-            // REGISTERED but NOT enabled by default (opt-in via F3 toggle).
-            this.registry.applySkyConfig(skyConfig, `${folderName}/${relPath}`);
+            this.registry.applySkyConfig(skyConfig);
           }
         } catch (e) {
           console.warn(`[ModLoader] Sky config load failure at ${relPath}:`, e);

@@ -10,6 +10,15 @@
  * received zero ambient light and rendered too dark / effectively invisible
  * against the purple sky clearColor.
  *
+ * VOXEL-LIGHT-REPAIR PASS — when `litTerrainMaterials` is true (the default),
+ * ALL opaque blocks get a custom StandardMaterial with `disableLighting = true`.
+ * This makes the baked vertex colors (matColor × AO × VoxelLightManager tint)
+ * the FINAL visible color — no Babylon scene-light multiplication. Day/night
+ * works through the voxel light's skyLight × timeMultiplier baked into vertex
+ * colors, NOT through Babylon scene lights. This is the key fix for "at
+ * night/underground, vertex colors disappear": with disableLighting=true,
+ * vertex colors are always visible regardless of scene ambient/sun intensity.
+ *
  * This version:
  *   - Prefers `noa.rendering.makeStandardMaterial(name)` when available, so
  *     our materials inherit noa's exact defaults (ambientColor=1,1,1,
@@ -21,6 +30,8 @@
  *     colors) to isolate material regressions.
  *   - Passes the material to noa via `registerMaterial({ renderMaterial })`.
  *   - Sets maxSimultaneousLights, fogEnabled, emissive for light_source.
+ *   - When litTerrainMaterials=true: disableLighting=true, useVertexColors=true
+ *     on ALL opaque terrain materials so vertex colors are final.
  *   - Missing textures NEVER crash the game.
  */
 
@@ -78,18 +89,12 @@ export class MaterialService {
   private maxSimultaneousLights: number;
   private safeMaterialsMode: boolean;
   private customTerrainMaterialsMode: boolean;
-  /**
-   * When true (default), ALL opaque solid blocks get a LIT StandardMaterial
-   * (disableLighting=false, emissiveColor=0, maxSimultaneousLights=8,
-   * fogEnabled=true, ambientColor=1,1,1) instead of noa's internal flat-color
-   * material. This is REQUIRED so that:
-   *   - day/night actually darkens terrain (noa's default material receives a
-   *     constant 0.5 scene.ambientColor fill that prevents darkness)
-   *   - placed dynamic PointLights illuminate nearby terrain
-   *   - the Full Dark / Lamp Only tests work
-   * Textures still load gracefully (attached only on successful load, so a
-   * missing texture never breaks material.isReady()).
-   */
+  /** When true (default), ALL opaque blocks get a custom StandardMaterial with
+   *  disableLighting=true so the baked vertex colors (matColor × AO × voxel
+   *  light tint) are the FINAL visible color. This is the key fix for the
+   *  voxel light system: at night/underground, scene ambient/sun no longer
+   *  hide the vertex colors. Day/night works through the voxel light's
+   *  skyLight × timeMultiplier baked into vertex colors. */
   private litTerrainMaterials: boolean;
   private built: Set<string> = new Set();
   private warnedMissing: Set<string> = new Set();
@@ -147,15 +152,21 @@ export class MaterialService {
    * Build + register a single block's material. Safe to call multiple times
    * for the same materialName — subsequent calls are no-ops.
    *
-   * PASS 4 "Purple Dimension" FIX — default behavior is now to use noa's
-   * proven flat-color registration for ordinary opaque non-emissive blocks.
-   * Custom renderMaterial is reserved for:
+   * VOXEL-LIGHT-REPAIR: when `litTerrainMaterials` is true (the default),
+   * ALL opaque blocks get a custom StandardMaterial with disableLighting=true.
+   * This makes the baked vertex colors (matColor × AO × VoxelLightManager tint)
+   * the FINAL visible color — no scene-light multiplication. This is required
+   * for the voxel light system: at night/underground, scene ambient/sun would
+   * otherwise hide the vertex colors. With disableLighting=true, the vertex
+   * colors are always visible, and day/night is driven by the skyLight ×
+   * timeMultiplier baked into vertex colors by VoxelLightManager.recolorMesh.
+   *
+   * Custom renderMaterial is also reserved for:
    *   - light_source blocks (need emissiveColor for glow)
    *   - blocks with emissiveColor/emissiveTexture
    *   - blocks with actual successfully loaded textures
    *   - ?customTerrainMaterials=1 opt-in dev flag (all blocks get custom mats)
-   * This keeps normal terrain (red dust, stone, etc.) rendering reliably via
-   * noa's default pipeline while still allowing lamps/artifacts to glow.
+   *   - litTerrainMaterials=true (default) — all opaque blocks get unlit mats
    */
   public registerBlockMaterial(block: BlockDefinition): void {
     if (this.built.has(block.materialName)) return;
@@ -170,17 +181,16 @@ export class MaterialService {
       (!!block.material.emissiveColor ||
         !!block.material.emissiveTexture ||
         !!block.material.emissiveStrength);
-    // LIT TERRAIN MODE: build a lit StandardMaterial for ordinary opaque blocks
-    // so day/night + dynamic lights affect terrain. This is the default.
+    // litTerrainMaterials forces ALL opaque blocks through the custom
+    // unlit-material path so vertex colors are the final visible color.
     const needsCustomMaterial =
-      this.customTerrainMaterialsMode ||
       this.litTerrainMaterials ||
+      this.customTerrainMaterialsMode ||
       isLightSource ||
       hasEmissiveConfig;
 
-    // DEFAULT MODE (only when litTerrainMaterials is OFF): ordinary opaque
-    // block with no emissive needs → use noa's flat-color registration. noa
-    // builds its own proven (but unlit-with-respect-to-dynamic-lights) material.
+    // DEFAULT MODE: ordinary opaque block with no emissive needs → use noa's
+    // flat-color registration. noa builds its own proven terrain material.
     if (!needsCustomMaterial) {
       this.registry.registerMaterial(block.materialName, { color: block.color });
       this.registry.registerBlock(block.id, {
@@ -189,7 +199,7 @@ export class MaterialService {
         opaque: block.opaque !== false,
       });
       console.log(
-        `[MaterialService] registered flat color for ${block.materialName} (noa default material, litTerrainMaterials OFF).`
+        `[MaterialService] registered flat color for ${block.materialName} (noa default material).`
       );
       return;
     }
@@ -208,25 +218,52 @@ export class MaterialService {
       return;
     }
 
-    // CUSTOM MATERIAL MODE: light_source / emissive / textured blocks.
+    // CUSTOM MATERIAL MODE: light_source / emissive / textured blocks, OR
+    // litTerrainMaterials=true (default) — all opaque blocks get an unlit
+    // vertex-color-driven material so the baked voxel light shows through.
     const mat = this.createBaseMaterial(`fp_${block.materialName}`);
     mat.name = `fp_${block.materialName}`;
 
     const [cr, cg, cb] = block.color;
-    mat.diffuseColor = new BABYLON.Color3(cr, cg, cb);
 
     this.applyMaterialConfig(mat, block);
     this.applyEmissiveForLightSource(mat, block);
 
-    // Cap maxSimultaneousLights at the quality preset's cap (6-8).
+    // Cap maxSimultaneousLights at the quality preset's cap.
     mat.maxSimultaneousLights = Math.min(
       this.maxSimultaneousLights,
       8
     );
 
-    mat.fogEnabled = true;
+    // PERFORMANCE VOXEL MODE: terrain material policy.
+    //
+    // noa's mesher bakes matColor × AO into vertex colors (confirmed:
+    // terrainMesher.js pushAOColor: colors[ix] = baseCol[0] * mult).
+    // Our recolorMesh then multiplies base vertex color × skyR(1.0) + blockPart.
+    //
+    // With disableLighting=false, Babylon computes:
+    //   finalColor = diffuseColor * vertexColor * lightContribution + ambient
+    //
+    // If diffuseColor = blockColor (e.g. [0.75, 0.25, 0.15]) AND vertexColor
+    // already contains matColor × AO, the material color is SQUARED:
+    //   finalColor = matColor² × AO × light — too dark.
+    //
+    // FIX: diffuseColor = [1,1,1] (white passthrough). The vertex color
+    // already contains the full material color × AO × voxel light. Babylon's
+    // HemisphericLight provides the lightContribution (day/night brightness)
+    // which multiplies the vertex color. No double-coloring.
+    mat.fogEnabled = false; // fog handled at scene level; material fog can darken lit tests
 
-    // Ensure ambientColor = (1,1,1) so the block receives scene ambient light.
+    if (this.litTerrainMaterials) {
+      mat.disableLighting = false;
+      mat.diffuseColor = new BABYLON.Color3(1, 1, 1); // WHITE PASSTHROUGH — vertex color has matColor
+      (mat as any).useVertexColors = true;
+    } else {
+      mat.diffuseColor = new BABYLON.Color3(cr, cg, cb);
+    }
+
+    // Ensure ambientColor = (1,1,1) so the block receives scene ambient light
+    // (only matters when disableLighting=false; harmless otherwise).
     if (
       !mat.ambientColor ||
       (mat.ambientColor.r === 0 &&
@@ -250,7 +287,7 @@ export class MaterialService {
 
     console.log(
       `[MaterialService] registered custom renderMaterial for ${block.materialName}` +
-        ` (lightSource=${isLightSource}, emissive=${hasEmissiveConfig}, maxLights=${mat.maxSimultaneousLights})`
+        ` (lightSource=${isLightSource}, emissive=${hasEmissiveConfig}, maxLights=${mat.maxSimultaneousLights}, disableLighting=${mat.disableLighting}, useVertexColors=${(mat as any).useVertexColors === true})`
     );
   }
 

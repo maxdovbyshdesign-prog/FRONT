@@ -34,23 +34,6 @@ export interface VisualTuning {
   noonSunIntensity: number;
   /** Sun intensity at midnight (0-1, usually 0). */
   midnightSunIntensity: number;
-  /**
-   * scene.ambientColor brightness at full day (0-1). This is the CRITICAL
-   * day/night knob: noa sets scene.ambientColor=(0.5,0.5,0.5) at boot and the
-   * old code never changed it, leaving a constant 0.5 fill that prevented
-   * night from ever getting dark and drowned out placed lamps. Driving this
-   * from the day/night cycle makes night genuinely dark and lets dynamic
-   * lights stand out.
-   */
-  daySceneAmbient: number;
-  /** scene.ambientColor brightness at full night (0-1). Low = dark night. */
-  nightSceneAmbient: number;
-  /** Multiplier on the resolved scene.ambientColor (0-3). */
-  sceneAmbientMultiplier: number;
-  /** Whether a separate moon light illuminates the scene at night. */
-  moonLightEnabled: boolean;
-  /** Moon light intensity at full night (0-1). */
-  moonLightIntensity: number;
 
   // ---- Time ----
   timeFrozen: boolean;
@@ -76,14 +59,7 @@ export interface VisualTuning {
   contrast: number;
 
   // ---- Sky ----
-  /**
-   * MASTER toggle for all sky meshes (sun/moon/stars/clouds). When false,
-   * every celestial body is disabled regardless of the per-body flags below.
-   * This is what "Sky Off / Sky On" actually flips — the per-body flags were
-   * previously re-enabled every frame by setVisibilityOverrides, which is why
-   * the buttons appeared to do nothing.
-   */
-  skyMeshesEnabled: boolean;
+  skyVisible: boolean;
   sunVisible: boolean;
   moonVisible: boolean;
   starsVisible: boolean;
@@ -92,45 +68,33 @@ export interface VisualTuning {
   moonSize: number;
   starBrightness: number; // 0-1 multiplier on star alpha
 
-  // ---- Mod sky overlay ----
-  /**
-   * Opt-in toggle for the legacy mod sky overlay (e.g.
-   * example-ruins-pack/sky/sky.json). DEFAULT OFF. When off, built-in visual
-   * presets fully control sky/fog color. When on, the registered mod values
-   * are merged on top and F3 labels them as the source.
-   */
-  useModSkyOverlay: boolean;
-
-  // ---- ClearColor override ----
-  /**
-   * Hex string that overrides scene.clearColor directly (bypassing presets and
-   * mod overlay). null = clearColor comes from the resolved preset/overlay.
-   * Lets QA prove clearColor is separate from sky meshes.
-   */
-  clearColorOverrideHex: string | null;
-
   // ---- Materials ----
   /** "default" = noa flat color for normal blocks, "custom" = custom renderMaterial for all, "debug" = force unlit orange. */
   terrainMaterialMode: "default" | "custom" | "debug";
-  /**
-   * When true, MaterialService builds a LIT StandardMaterial (disableLighting
-   * = false, emissiveColor = 0, maxSimultaneousLights = 8) for ALL opaque
-   * terrain blocks, not just light sources. This guarantees dynamic point
-   * lights illuminate normal terrain and that day/night actually darkens it.
-   * Textures still load gracefully (attached only on success).
-   */
-  litTerrainMaterials: boolean;
 
   // ---- Chunk / render distance ----
   /** Pending chunk add distance (requires renderer restart to apply). */
   pendingChunkAddDistance: number | null;
   pendingChunkRemoveDistance: number | null;
   fogMatchRenderDistance: boolean;
-  /** Show chunk boundary wireframes for QA. */
-  showChunkBoundaries: boolean;
 
   // ---- Preset name (for display) ----
   activePresetName: string;
+
+  // ---- Atmosphere biome source (decoupled from black-glass terrain) ----
+  atmosphereBiomeMode: "fixed_red_wasteland" | "follow_biome" | "manual_black_glass";
+
+  // ---- Mod sky overlay (opt-in, default OFF) ----
+  useModSkyOverlay: boolean;
+
+  // ---- Scene ambient (day/night driving) ----
+  daySceneAmbient: number;
+  nightSceneAmbient: number;
+  sceneAmbientMultiplier: number;
+
+  // ---- Moon light ----
+  moonLightEnabled: boolean;
+  moonLightIntensity: number;
 }
 
 export const DEFAULT_VISUAL_TUNING: VisualTuning = {
@@ -146,33 +110,33 @@ export const DEFAULT_VISUAL_TUNING: VisualTuning = {
   dayAmbientIntensity: 0.55,
   noonSunIntensity: 1.0,
   midnightSunIntensity: 0.0,
-  daySceneAmbient: 0.35,
-  nightSceneAmbient: 0.06,
-  sceneAmbientMultiplier: 1.0,
-  moonLightEnabled: true,
-  moonLightIntensity: 0.25,
 
   timeFrozen: false,
   timeSpeedMultiplier: 1.0,
 
-  dynamicLightsEnabled: true,
-  activeLightBudget: 6,
+  dynamicLightsEnabled: false,
+  activeLightBudget: 3,
   lightIntensityMultiplier: 1.0,
   lightRangeMultiplier: 1.0,
 
   glowEnabled: true,
-  glowIntensity: 0.15,
+  glowIntensity: 0.12,
   glowKernel: 20,
   bloomEnabled: false,
   bloomWeight: 0.25,
   bloomThreshold: 0.9,
   bloomKernel: 24,
   fxaaEnabled: true,
-  toneMappingEnabled: true,
-  exposure: 1.0,
-  contrast: 1.03,
+  // PERFORMANCE VOXEL MODE: tone mapping OFF. With disableLighting=true on
+  // terrain materials, vertex colors are the final pre-post-process color.
+  // ACES tone mapping darkens mid-tones, making the world look like "Polar
+  // Night." Disabling it lets the baked vertex colors appear at their true
+  // brightness. This is correct for an unlit/lightmap-style pipeline.
+  toneMappingEnabled: false,
+  exposure: 1.3,
+  contrast: 1.0,
 
-  skyMeshesEnabled: true,
+  skyVisible: true,
   sunVisible: true,
   moonVisible: true,
   starsVisible: true,
@@ -181,18 +145,21 @@ export const DEFAULT_VISUAL_TUNING: VisualTuning = {
   moonSize: 40,
   starBrightness: 1.0,
 
-  useModSkyOverlay: false,
-  clearColorOverrideHex: null,
-
   terrainMaterialMode: "default",
-  litTerrainMaterials: true,
 
   pendingChunkAddDistance: null,
   pendingChunkRemoveDistance: null,
   fogMatchRenderDistance: true,
-  showChunkBoundaries: false,
 
   activePresetName: "Atmospheric Default",
+
+  atmosphereBiomeMode: "fixed_red_wasteland",
+  useModSkyOverlay: false,
+  daySceneAmbient: 0.25,
+  nightSceneAmbient: 0.10,
+  sceneAmbientMultiplier: 1.0,
+  moonLightEnabled: true,
+  moonLightIntensity: 0.25,
 };
 
 const STORAGE_KEY = "frontierPlanet.visualSettings";
@@ -228,11 +195,6 @@ export const NAMED_PRESETS: Record<string, Partial<VisualTuning>> = {
     activeLightBudget: 4,
     ambientIntensityMultiplier: 1.2,
     sunIntensityMultiplier: 1.3,
-    useModSkyOverlay: false,
-    clearColorOverrideHex: null,
-    skyMeshesEnabled: true,
-    daySceneAmbient: 0.4,
-    nightSceneAmbient: 0.12,
     activePresetName: "Safe Baseline",
   },
   "Red Wasteland Day": {
@@ -245,11 +207,6 @@ export const NAMED_PRESETS: Record<string, Partial<VisualTuning>> = {
     bloomEnabled: false,
     ambientIntensityMultiplier: 1.0,
     sunIntensityMultiplier: 1.0,
-    daySceneAmbient: 0.4,
-    nightSceneAmbient: 0.12,
-    useModSkyOverlay: false,
-    clearColorOverrideHex: null,
-    skyMeshesEnabled: true,
     activePresetName: "Red Wasteland Day",
   },
   "Red Wasteland Night": {
@@ -258,20 +215,9 @@ export const NAMED_PRESETS: Record<string, Partial<VisualTuning>> = {
     glowEnabled: true,
     glowIntensity: 0.18,
     bloomEnabled: false,
-    nightAmbientIntensity: 0.12,
-    ambientIntensityMultiplier: 0.7,
-    sunIntensityMultiplier: 0.0,
-    midnightSunIntensity: 0.0,
-    daySceneAmbient: 0.35,
-    nightSceneAmbient: 0.04,
-    sceneAmbientMultiplier: 1.0,
-    moonLightEnabled: true,
-    moonLightIntensity: 0.22,
-    useModSkyOverlay: false,
-    clearColorOverrideHex: null,
-    skyMeshesEnabled: true,
-    starsVisible: true,
-    moonVisible: true,
+    nightAmbientIntensity: 0.15,
+    ambientIntensityMultiplier: 0.8,
+    sunIntensityMultiplier: 0.5,
     activePresetName: "Red Wasteland Night",
   },
   "Debug Fullbright": {
@@ -282,12 +228,7 @@ export const NAMED_PRESETS: Record<string, Partial<VisualTuning>> = {
     sunIntensityMultiplier: 1.5,
     nightAmbientIntensity: 0.8,
     dayAmbientIntensity: 0.9,
-    daySceneAmbient: 0.9,
-    nightSceneAmbient: 0.9,
-    sceneAmbientMultiplier: 1.5,
     terrainMaterialMode: "debug",
-    useModSkyOverlay: false,
-    clearColorOverrideHex: null,
     activePresetName: "Debug Fullbright (DEBUG ONLY)",
   },
   "Atmospheric Test": {
@@ -297,10 +238,6 @@ export const NAMED_PRESETS: Record<string, Partial<VisualTuning>> = {
     bloomEnabled: false,
     ambientIntensityMultiplier: 1.0,
     sunIntensityMultiplier: 1.0,
-    daySceneAmbient: 0.38,
-    nightSceneAmbient: 0.07,
-    useModSkyOverlay: false,
-    clearColorOverrideHex: null,
     activePresetName: "Atmospheric Test",
   },
 };

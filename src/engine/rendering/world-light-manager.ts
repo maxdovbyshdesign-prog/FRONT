@@ -58,6 +58,12 @@ export class WorldLightManager {
   private sortedScratch: LightEntry[] = [];
   private frame = 0;
   private disposed = false;
+  /**
+   * Master enabled state for real PointLights. PERFORMANCE MODE: false by
+   * default. Tracked so newly-created lights (from registerLight/registerStaticLights)
+   * inherit the disabled state — otherwise they'd default to enabled.
+   */
+  private enabled: boolean = false;
 
   constructor(scene: BABYLON.Scene, settings: GraphicsSettings) {
     this.scene = scene;
@@ -146,6 +152,11 @@ export class WorldLightManager {
    */
   public update(playerPos: VoxelPosition): void {
     if (this.disposed || this.registry.size === 0) return;
+    // PERFORMANCE: when real PointLights are disabled (the default in
+    // performance_voxel mode), do NOT create or animate any Babylon lights.
+    // Early return — no new PointLights are created, no wasted work. Existing
+    // lights (if any) were already setEnabled(false) by setEnabled().
+    if (!this.enabled) return;
     this.frame++;
 
     const px = playerPos[0];
@@ -157,22 +168,13 @@ export class WorldLightManager {
     if (this.frame % 6 === 1 || this.sortedScratch.length !== this.registry.size) {
       this.sortedScratch = Array.from(this.registry.values());
       this.sortedScratch.sort((a, b) => {
-        // Proximity-aware scoring: a light's effective "rank distance" is its
-        // real distance MINUS (priority * 3). This means a nearby placed lamp
-        // (e.g. dist 3, pri 5 → score -12) beats a far mission artifact (dist
-        // 30, pri 10 → score 0), so the player's immediate surroundings are
-        // always lit by dynamic lights. High-priority lights still win when
-        // close (artifact at dist 5, pri 10 → score -25). Far lights that lose
-        // the budget still glow via their emissiveColor + GlowLayer.
+        if (b.priority !== a.priority) return b.priority - a.priority;
         const da = distSq(a, px, py, pz);
         const db = distSq(b, px, py, pz);
-        const scoreA = Math.sqrt(da) - a.priority * 3;
-        const scoreB = Math.sqrt(db) - b.priority * 3;
-        return scoreA - scoreB;
+        return da - db;
       });
     }
 
-    // Activate the top `budget` lights; cull the rest.
     let activeCount = 0;
     for (const entry of this.sortedScratch) {
       const shouldBeActive = activeCount < budget;
@@ -217,6 +219,7 @@ export class WorldLightManager {
         spot.specular = new BABYLON.Color3(r * 0.5, g * 0.5, b * 0.5);
         spot.intensity = entry.baseIntensity;
         spot.range = this.scaleRange(entry.profile.range);
+        spot.setEnabled(this.enabled); // inherit master enabled state
         entry.light = spot;
       } else if (entry.profile.kind === "point") {
         const point = new BABYLON.PointLight(name, pos, this.scene);
@@ -224,6 +227,7 @@ export class WorldLightManager {
         point.specular = new BABYLON.Color3(r * 0.4, g * 0.4, b * 0.4);
         point.intensity = entry.baseIntensity;
         point.range = this.scaleRange(entry.profile.range);
+        point.setEnabled(this.enabled); // inherit master enabled state
         entry.light = point;
       }
       // "emissive_only" -> no Babylon light; the emissive material + GlowLayer
@@ -296,10 +300,7 @@ export class WorldLightManager {
       blockName: string;
       intensity: number;
       range: number;
-      color: [number, number, number];
-      priority: number;
       active: boolean;
-      enabled: boolean;
       distance: number;
     }>;
   } {
@@ -313,10 +314,7 @@ export class WorldLightManager {
       blockName: e.blockDef.name,
       intensity: e.baseIntensity,
       range: this.scaleRange(e.profile.range),
-      color: (e.profile.color || [1, 1, 1]) as [number, number, number],
-      priority: e.priority,
       active: !!e.light,
-      enabled: e.light ? e.light.isEnabled() : false,
       distance: Math.sqrt(distSq(e, px, py, pz)),
     }));
     all.sort((a, b) => a.distance - b.distance);
@@ -336,16 +334,12 @@ export class WorldLightManager {
   }
 
   public getActiveCount(): number {
+    // Count only ENABLED real Babylon lights (not disabled objects).
     let n = 0;
     this.registry.forEach((e) => {
-      if (e.light) n++;
+      if (e.light && e.light.isEnabled()) n++;
     });
     return n;
-  }
-
-  /** The actual runtime budget (may differ from adapter.graphicsSettings after setBudget). */
-  public getBudget(): number {
-    return this.settings.maxActiveDynamicLights;
   }
 
   /**
@@ -361,6 +355,25 @@ export class WorldLightManager {
   public setBudget(budget: number): void {
     this.settings = { ...this.settings, maxActiveDynamicLights: Math.max(1, Math.min(12, budget)) };
     console.log(`[WorldLightManager] Active light budget set to ${this.settings.maxActiveDynamicLights}.`);
+  }
+
+  /**
+   * Master enable for real Babylon PointLights. PERFORMANCE MODE: disabled by
+   * default — the primary lighting is VoxelLightManager (baked vertex colors).
+   * Real PointLights are debug-only (cap 3). When disabled, all active lights
+   * have isEnabled=false so they stop illuminating terrain (their emissiveColor
+   * + GlowLayer still glow). Sun/moon/ambient are NOT affected.
+   */
+  public setEnabled(enabled: boolean): void {
+    this.enabled = enabled;
+    this.registry.forEach((e) => {
+      if (e.light) e.light.setEnabled(enabled);
+    });
+    console.log(`[WorldLightManager] Real PointLights ${enabled ? "enabled" : "disabled"} (sun/moon/ambient unaffected).`);
+  }
+
+  public isEnabled(): boolean {
+    return this.enabled;
   }
 
   public dispose(): void {
