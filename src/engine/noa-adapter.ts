@@ -10,7 +10,7 @@ import { WorldService } from '../world/world-service';
 import { BlockService } from '../blocks/block-service';
 import { MissionService } from '../missions/mission-service';
 import { UiService } from '../ui/ui-service';
-import { GameEvent, GameEventType } from '../types';
+import { GameEvent, GameEventType, BlockDefinition } from '../types';
 import { gameState } from '../game/game-state';
 import { ModRegistry } from '../modding/mod-registry';
 import { AudioService } from '../audio/audio-service';
@@ -166,6 +166,12 @@ export class NoaEngineAdapter {
   private visualTuning: VisualTuning = shouldResetVisualSettings()
     ? (localStorage.removeItem("frontierPlanet.visualSettings"), { ...DEFAULT_VISUAL_TUNING })
     : loadVisualTuning();
+  /** Walking Light Monitor state. */
+  private walkingMonitorActive: boolean = false;
+  private walkingMonitorStartChunk: string = "";
+  private walkingMonitorPrevChunk: string = "";
+  private walkingMonitorLastResult: any = null;
+  private walkingMonitorFpsHistory: number[] = [];
 
   // Rendering services (Pass 1).
   private materialService: MaterialService | null = null;
@@ -442,18 +448,17 @@ export class NoaEngineAdapter {
     try {
       (this.noa as any).on('addingTerrainMesh', (mesh: any) => {
         if (!mesh || !mesh.name || !mesh.name.startsWith('chunk_')) return;
-        const ox = mesh.position ? Math.floor(mesh.position.x) : 0;
-        const oy = mesh.position ? Math.floor(mesh.position.y) : 0;
-        const oz = mesh.position ? Math.floor(mesh.position.z) : 0;
+        // Use Math.round for negative coordinate safety (chunk origins are
+        // exact multiples of 16, but float drift can make them -15.9999999).
+        const ox = mesh.position ? Math.round(mesh.position.x) : 0;
+        const oy = mesh.position ? Math.round(mesh.position.y) : 0;
+        const oz = mesh.position ? Math.round(mesh.position.z) : 0;
         this.voxelLightManager?.recolorMesh(mesh, ox, oy, oz);
         // After recoloring the new mesh, also recolor any NEIGHBOR meshes
         // whose light data may have changed due to this chunk's geometry.
-        // This catches the case where noa remeshes one chunk but the light
-        // data of a neighbor (already recomputed by relightAround) hasn't
-        // been applied to the neighbor's mesh yet.
-        const cx = Math.floor(ox / CHUNK_SIZE);
-        const cy = Math.floor(oy / CHUNK_SIZE);
-        const cz = Math.floor(oz / CHUNK_SIZE);
+        const cx = Math.round(ox / CHUNK_SIZE);
+        const cy = Math.round(oy / CHUNK_SIZE);
+        const cz = Math.round(oz / CHUNK_SIZE);
         const neighborKeys: string[] = [];
         for (let dx = -1; dx <= 1; dx++) {
           for (let dy = -1; dy <= 1; dy++) {
@@ -899,6 +904,7 @@ export class NoaEngineAdapter {
         showChunkGrid(visible: boolean) {
           const sc = adapter.getSceneSafe();
           if (!sc) return;
+          adapter.chunkGridVisible = visible;
           if (visible) {
             adapter.buildChunkGrid(sc);
           } else {
@@ -929,6 +935,48 @@ export class NoaEngineAdapter {
         async ruinStressTest() {
           return adapter.runRuinStressTest();
         },
+        /** 3×3 Surface Light Test (the CORE acceptance test). */
+        async surface3x3Test(wx?: number, wy?: number, wz?: number) {
+          return adapter.runSurface3x3Test(wx, wy, wz);
+        },
+        /** Far From Spawn Light Test (visual, 3×3 surface validation). */
+        async farFromSpawnTest() {
+          return adapter.runFarFromSpawnTest();
+        },
+        /** Place/Remove 3×3 Stress Test (20 cycles). */
+        async placeRemoveStressTest() {
+          return adapter.runPlaceRemoveStressTest();
+        },
+        /** Inspect lighting at the crosshair target block. */
+        inspectCrosshairLighting() {
+          return adapter.inspectCrosshairLighting();
+        },
+        /** Start walking light monitor. */
+        startWalkingMonitor() {
+          adapter.startWalkingMonitor();
+        },
+        /** Stop walking light monitor. */
+        stopWalkingMonitor() {
+          adapter.stopWalkingMonitor();
+        },
+        /** Get walking monitor state + last result. */
+        walkingMonitor: adapter.getWalkingMonitorState(),
+        /** Inspect the actual block under the crosshair with full chain diagnostics. */
+        inspectTargetLight() {
+          return adapter.inspectTargetLight();
+        },
+        /** 3×3 test around the crosshair target (existing light or place/remove). */
+        async run3x3AroundTargetTest() {
+          return adapter.run3x3AroundTargetTest();
+        },
+        /** Resolve which light block to use for tests. */
+        resolveTestLightBlock() {
+          return adapter.resolveTestLightBlock();
+        },
+        /** User Light Repro: test near [-4,15,-12] and far [-3,18,-21]. */
+        async runUserLightRepro() {
+          return adapter.runUserLightRepro();
+        },
         /** Get chunk grid debug info. */
         getChunkGridDebug() {
           const pp = adapter.getPlayerPositionSafe() || [0, 15, 0];
@@ -946,6 +994,33 @@ export class NoaEngineAdapter {
             lastAffectedChunks: adapter.voxelLightManager?.getLastAffectedChunkKeys() ?? [],
             relightQueueKeys: adapter.voxelLightManager?.getRelightQueueKeys() ?? [],
             chunksWithLightData: adapter.voxelLightManager?.getChunkKeysWithLightData().length ?? 0,
+          };
+        },
+        /** Chunk grid debug info as a property (for React polling). */
+        get chunkGridDebug() {
+          const pp = adapter.getPlayerPositionSafe() || [0, 15, 0];
+          const cx = Math.floor(pp[0] / 16);
+          const cz = Math.floor(pp[2] / 16);
+          const lx = Math.floor(pp[0]) - cx * 16;
+          const lz = Math.floor(pp[2]) - cz * 16;
+          return {
+            playerWorldPos: [Math.floor(pp[0]), Math.floor(pp[1]), Math.floor(pp[2])],
+            playerChunkKey: `${cx},0,${cz}`,
+            playerLocalCell: [lx, Math.floor(pp[1]) % 16, lz],
+            distToBorderX: Math.min(lx, 15 - lx),
+            distToBorderZ: Math.min(lz, 15 - lz),
+            isNearBorder: Math.min(lx, 15-lx, lz, 15-lz) <= 2,
+            lastAffectedChunks: adapter.voxelLightManager?.getLastAffectedChunkKeys() ?? [],
+            relightQueueKeys: adapter.voxelLightManager?.getRelightQueueKeys() ?? [],
+            chunksWithLightData: adapter.voxelLightManager?.getChunkKeysWithLightData().length ?? 0,
+            chunkGridActive: adapter.chunkGridVisible,
+            chunkGridMeshExists: !!adapter.chunkGridLines,
+            chunkGridLineCount: adapter.chunkGridLines ? (adapter.chunkGridLines as any)._positions?.length ?? 0 : 0,
+            chunkGridPlayerChunk: `${cx},0,${cz}`,
+            chunkGridYMin: adapter.chunkGridYMin,
+            chunkGridYMax: adapter.chunkGridYMax,
+            chunkGridLastBuildTime: adapter.chunkGridLastBuildTime,
+            sceneContainsChunkGridMesh: !!adapter.getSceneSafe()?.getMeshByName("fp_chunk_grid"),
           };
         },
       };
@@ -1140,12 +1215,24 @@ export class NoaEngineAdapter {
       // which ran BEFORE light data existed → mesh got black/fallback colors.
       // Now light data is computed first, so when addingTerrainMesh fires,
       // the light lookup succeeds and the mesh gets correct colors.
-      this.voxelLightManager?.computeInitialLight(x, y, z, flatVoxels);
+      this.voxelLightManager?.computeInitialLight(x, y, z, flatVoxels, false);
       // Also register any light sources found in this chunk into the global
       // voxelLightSources registry, so neighbor chunks (which may load later)
       // can seed cross-chunk propagation from this chunk's sources.
-      this.voxelLightManager?.registerSourcesFromVoxels(x, y, z, flatVoxels);
+      const newSources = this.voxelLightManager?.registerSourcesFromVoxels(x, y, z, flatVoxels) ?? [];
       this.noa.world.setChunkData(id, ndarray);
+      // If this chunk contains light sources, sync block light visuals for
+      // affected neighbor chunks immediately. This ensures static/generated
+      // lights illuminate visible neighbor meshes on chunk load — not just
+      // when the player places/breaks a block.
+      if (newSources.length > 0) {
+        const sc = this.getSceneSafe();
+        if (sc) {
+          for (const src of newSources) {
+            this.syncBlockLightVisualsAroundSource(sc, src.x, src.y, src.z, `chunk load source at ${src.x},${src.y},${src.z}`);
+          }
+        }
+      }
       const elapsed = performance.now() - start;
 
       if (ENABLE_PERF_LOGS) {
@@ -1436,9 +1523,41 @@ export class NoaEngineAdapter {
 
         this.playerService.updatePosition(pos as [number, number, number]);
 
+        // Auto-rebuild chunk grid when player enters a new chunk.
+        if (this.chunkGridVisible) {
+          const pcx = Math.floor(pos[0] / 16);
+          const pcz = Math.floor(pos[2] / 16);
+          if (pcx !== this.lastGridPlayerChunkX || pcz !== this.lastGridPlayerChunkZ) {
+            this.lastGridPlayerChunkX = pcx;
+            this.lastGridPlayerChunkZ = pcz;
+            const sc2 = this.getSceneSafe();
+            if (sc2) this.buildChunkGrid(sc2);
+          }
+        }
+
         const headingObj = (this.noa as any).camera;
         const yawRad = headingObj ? headingObj.heading || 0 : 0;
         gameState.playerYaw = (yawRad * 180 / Math.PI) % 360;
+
+        // ---- Walking Light Monitor ----
+        // Tracks chunk boundary crossings and runs block light validation.
+        if (this.walkingMonitorActive) {
+          const pcx = Math.floor(pos[0] / 16);
+          const pcy = Math.floor(pos[1] / 16);
+          const pcz = Math.floor(pos[2] / 16);
+          const currentChunk = `${pcx},${pcy},${pcz}`;
+          if (this.walkingMonitorStartChunk === "") {
+            this.walkingMonitorStartChunk = currentChunk;
+            this.walkingMonitorPrevChunk = currentChunk;
+          }
+          if (currentChunk !== this.walkingMonitorPrevChunk) {
+            // Chunk boundary crossed! Run validation.
+            const oldChunk = this.walkingMonitorPrevChunk;
+            const newChunk = currentChunk;
+            this.walkingMonitorPrevChunk = newChunk;
+            this.walkingMonitorLastResult = this.runWalkingLightCheck(pos, oldChunk, newChunk);
+          }
+        }
       }
 
       // Track target block details on every frame.
@@ -1709,52 +1828,84 @@ export class NoaEngineAdapter {
   // ---- CHUNK GRID VISUALIZATION ----
   private chunkGridLines: BABYLON.LinesMesh | null = null;
   private chunkGridHighlight: BABYLON.LinesMesh | null = null;
+  private chunkGridVisible: boolean = false;
+  private chunkGridYMin: number = 0;
+  private chunkGridYMax: number = 0;
+  private chunkGridLastBuildTime: number = 0;
+  private chunkGridSegmentCount: number = 0;
+  private lastGridPlayerChunkX: number = 999;
+  private lastGridPlayerChunkZ: number = 999;
 
   public buildChunkGrid(scene: BABYLON.Scene): void {
     this.removeChunkGrid(scene);
     const pp = this.getPlayerPositionSafe() || [0, 15, 0];
     const px = Math.floor(pp[0]), py = Math.floor(pp[1]), pz = Math.floor(pp[2]);
-    const range = 48; // 3 chunks in each direction
-    const lines: BABYLON.Vector3[] = [];
-    const colors: BABYLON.Color4[] = [];
-    const gridColor = new BABYLON.Color4(0, 0.6, 0.6, 0.3); // dim cyan
-    const playerColor = new BABYLON.Color4(0, 1, 1, 0.8); // bright cyan
-    const affectedColor = new BABYLON.Color4(1, 1, 0, 0.6); // yellow
-    // X lines (along Z at each X=16k)
-    for (let x = px - range; x <= px + range; x += 16) {
-      const isPlayerLine = Math.floor(x / 16) === Math.floor(px / 16);
-      const c = isPlayerLine ? playerColor : gridColor;
-      lines.push(new BABYLON.Vector3(x, py - 2, pz - range), new BABYLON.Vector3(x, py - 2, pz + range));
-      colors.push(c, c);
+    const playerChunkX = Math.floor(px / 16);
+    const playerChunkZ = Math.floor(pz / 16);
+    const yMin = py - 32;
+    const yMax = py + 96;
+
+    // Use CreateLineSystem with INDEPENDENT line segments.
+    // Draw: current chunk (4 tall corner pillars + top/bottom outline),
+    //        target chunk (if different, same outline in contrasting color).
+    const segments: BABYLON.Vector3[][] = [];
+
+    const tgt = this.getTargetBlockFallback();
+    let targetChunkX = 999, targetChunkZ = 999;
+    if (tgt) {
+      targetChunkX = Math.floor(tgt.position[0] / 16);
+      targetChunkZ = Math.floor(tgt.position[2] / 16);
     }
-    // Z lines (along X at each Z=16k)
-    for (let z = pz - range; z <= pz + range; z += 16) {
-      const isPlayerLine = Math.floor(z / 16) === Math.floor(pz / 16);
-      const c = isPlayerLine ? playerColor : gridColor;
-      lines.push(new BABYLON.Vector3(px - range, py - 2, z), new BABYLON.Vector3(px + range, py - 2, z));
-      colors.push(c, c);
-    }
-    // Highlight affected chunks
-    const affectedKeys = this.voxelLightManager?.getLastAffectedChunkKeys() ?? [];
-    for (const key of affectedKeys) {
-      const [acx, , acz] = key.split(",").map(Number);
-      const ox = acx * 16, oz = acz * 16;
-      const c = affectedColor;
-      lines.push(
-        new BABYLON.Vector3(ox, py - 2, oz), new BABYLON.Vector3(ox + 16, py - 2, oz),
-        new BABYLON.Vector3(ox + 16, py - 2, oz), new BABYLON.Vector3(ox + 16, py - 2, oz + 16),
-        new BABYLON.Vector3(ox + 16, py - 2, oz + 16), new BABYLON.Vector3(ox, py - 2, oz + 16),
-        new BABYLON.Vector3(ox, py - 2, oz + 16), new BABYLON.Vector3(ox, py - 2, oz),
+
+    // Draw a chunk outline with 4 tall corner pillars
+    const drawChunkOutline = (cx: number, cz: number) => {
+      const ox = cx * 16, oz = cz * 16;
+      const c0 = [ox, yMin, oz], c1 = [ox + 16, yMin, oz], c2 = [ox + 16, yMin, oz + 16], c3 = [ox, yMin, oz + 16];
+      const c4 = [ox, yMax, oz], c5 = [ox + 16, yMax, oz], c6 = [ox + 16, yMax, oz + 16], c7 = [ox, yMax, oz + 16];
+      // 4 vertical corner pillars (tall, visible above hills)
+      segments.push(
+        [new BABYLON.Vector3(...c0 as [number,number,number]), new BABYLON.Vector3(...c4 as [number,number,number])],
+        [new BABYLON.Vector3(...c1 as [number,number,number]), new BABYLON.Vector3(...c5 as [number,number,number])],
+        [new BABYLON.Vector3(...c2 as [number,number,number]), new BABYLON.Vector3(...c6 as [number,number,number])],
+        [new BABYLON.Vector3(...c3 as [number,number,number]), new BABYLON.Vector3(...c7 as [number,number,number])],
       );
-      for (let i = 0; i < 8; i++) colors.push(c);
+      // Top outline
+      segments.push(
+        [new BABYLON.Vector3(...c4 as [number,number,number]), new BABYLON.Vector3(...c5 as [number,number,number])],
+        [new BABYLON.Vector3(...c5 as [number,number,number]), new BABYLON.Vector3(...c6 as [number,number,number])],
+        [new BABYLON.Vector3(...c6 as [number,number,number]), new BABYLON.Vector3(...c7 as [number,number,number])],
+        [new BABYLON.Vector3(...c7 as [number,number,number]), new BABYLON.Vector3(...c4 as [number,number,number])],
+      );
+      // Bottom outline
+      segments.push(
+        [new BABYLON.Vector3(...c0 as [number,number,number]), new BABYLON.Vector3(...c1 as [number,number,number])],
+        [new BABYLON.Vector3(...c1 as [number,number,number]), new BABYLON.Vector3(...c2 as [number,number,number])],
+        [new BABYLON.Vector3(...c2 as [number,number,number]), new BABYLON.Vector3(...c3 as [number,number,number])],
+        [new BABYLON.Vector3(...c3 as [number,number,number]), new BABYLON.Vector3(...c0 as [number,number,number])],
+      );
+    };
+
+    // Draw player chunk
+    drawChunkOutline(playerChunkX, playerChunkZ);
+    // Draw target chunk if different
+    if (targetChunkX !== 999 && (targetChunkX !== playerChunkX || targetChunkZ !== playerChunkZ)) {
+      drawChunkOutline(targetChunkX, targetChunkZ);
     }
-    this.chunkGridLines = BABYLON.MeshBuilder.CreateLines("fp_chunk_grid", { points: lines, colors }, scene);
+
+    this.chunkGridLines = BABYLON.MeshBuilder.CreateLineSystem("fp_chunk_grid", {
+      lines: segments,
+    }, scene);
     this.chunkGridLines.isPickable = false;
     this.chunkGridLines.alwaysSelectAsActiveMesh = true;
-    // Register with octree
+    this.chunkGridLines.color = new BABYLON.Color3(0.5, 0.5, 0.55); // neutral gray
+
+    this.chunkGridYMin = yMin;
+    this.chunkGridYMax = yMax;
+    this.chunkGridLastBuildTime = Date.now();
+    this.chunkGridSegmentCount = segments.length;
     const octMgr = (this.noa.rendering as any)?._octreeManager;
     if (octMgr && typeof octMgr.addMesh === "function") octMgr.addMesh(this.chunkGridLines, false);
-    console.log(`[NoaEngineAdapter] Chunk grid ON: ${lines.length / 2} lines, ${affectedKeys.length} affected chunks highlighted.`);
+    console.log(`[NoaEngineAdapter] Chunk grid ON: ${segments.length} segments, player chunk=${playerChunkX},0,${playerChunkZ}, yMin=${yMin}, yMax=${yMax}`);
   }
 
   public removeChunkGrid(scene: BABYLON.Scene): void {
@@ -1789,6 +1940,11 @@ export class NoaEngineAdapter {
   }
 
   // ---- LIGHT SWEEP TEST ----
+  /**
+   * Sweep test that runs the 3×3 Surface Light Test at each step.
+   * Stops on first FAIL. Each step validates that SURROUNDING cells
+   * brighten/dim, not just that the source is bright.
+   */
   public async runLightSweep(direction: "+X" | "-X" | "+Z" | "-Z" | "diag"): Promise<any[]> {
     const sc = this.getSceneSafe();
     if (!sc) return [{ error: "no scene" }];
@@ -1799,7 +1955,8 @@ export class NoaEngineAdapter {
     const bd = this.blockService.getBlock(7); // yellow halogen
     if (!bd) return [{ error: "no block def for id 7" }];
 
-    for (const dist of positions) {
+    for (let stepIdx = 0; stepIdx < positions.length; stepIdx++) {
+      const dist = positions[stepIdx];
       let lx: number, lz: number;
       if (direction === "+X") { lx = dist; lz = 0; }
       else if (direction === "-X") { lx = -dist; lz = 0; }
@@ -1813,64 +1970,54 @@ export class NoaEngineAdapter {
         if (this.getBlockIdAt(lx, y, lz) !== 0) { ly = y + 1; break; }
       }
 
-      // Teleport player
-      const eng = this.noa;
-      eng.entities.setPosition(eng.playerEntity, [lx, ly + 2, lz]);
-
-      // Wait for visible meshes
+      // Teleport player + wait for meshes
+      this.noa.entities.setPosition(this.noa.playerEntity, [lx, ly + 2, lz]);
       const visibleMeshes = await this.waitForVisibleMeshesAround([lx, ly, lz], 3000);
 
-      // Record brightness before
-      const brightBefore = vlm.brightnessAtSurface(lx, ly, lz);
-
-      // Place light
-      this.worldService.setBlockOverride(lx, ly, lz, 7);
-      this.noa.setBlock(7, lx, ly, lz);
-      vlm.registerLight(lx, ly, lz, bd);
-      const sourceCountBefore = (vlm as any).voxelLightSources.size;
-      const result = vlm.relightAround(sc, lx, ly, lz);
-      const sourceCountAfter = (vlm as any).voxelLightSources.size;
-
-      // Check results
-      const brightAfter = vlm.brightnessAtSurface(lx, ly, lz);
-      const inspect = vlm.inspectLightingAt(lx, ly, lz);
-      const blockLightAtSource = inspect.blockLightR ?? 0;
-
-      // Remove light
-      this.worldService.setBlockOverride(lx, ly, lz, 0);
-      this.noa.setBlock(0, lx, ly, lz);
-      vlm.unregisterLight(lx, ly, lz);
-      vlm.relightAround(sc, lx, ly, lz);
-      const brightAfterRemove = vlm.brightnessAtSurface(lx, ly, lz);
+      // Run 3×3 surface test (the strict acceptance test)
+      const surfaceResult = vlm.runSurface3x3Test(
+        lx, ly, lz,
+        () => {
+          this.worldService.setBlockOverride(lx, ly, lz, 7);
+          this.noa.setBlock(7, lx, ly, lz);
+          vlm.registerLight(lx, ly, lz, bd);
+          vlm.relightAround(sc, lx, ly, lz);
+        },
+        () => {
+          this.worldService.setBlockOverride(lx, ly, lz, 0);
+          this.noa.setBlock(0, lx, ly, lz);
+          vlm.unregisterLight(lx, ly, lz);
+          vlm.relightAround(sc, lx, ly, lz);
+        }
+      );
 
       const cx = Math.floor(lx / 16), cz = Math.floor(lz / 16);
       const localX = lx - cx * 16, localZ = lz - cz * 16;
       const isBoundary = localX === 0 || localX === 15 || localZ === 0 || localZ === 15;
 
-      const pass = blockLightAtSource > 0 && result.recoloredMeshCount > 0 && brightAfter[0] >= brightBefore[0];
-      const inconclusive = visibleMeshes === 0;
-
       const stepResult = {
-        direction, stepIndex: positions.indexOf(dist), worldPos: [lx, ly, lz],
-        chunkKey: `${Math.floor(lx/16)},${Math.floor(ly/16)},${Math.floor(lz/16)}`,
+        direction,
+        stepIndex: stepIdx,
+        worldPos: [lx, ly, lz],
+        chunkKey: `${cx},${Math.floor(ly/16)},${cz}`,
         localCell: [localX, ly % 16, localZ],
         distFromSpawn: Math.sqrt(lx*lx + lz*lz),
         isChunkBoundary: isBoundary,
+        distToChunkBorderX: Math.min(localX, 15 - localX),
+        distToChunkBorderZ: Math.min(localZ, 15 - localZ),
         visibleMeshesNearby: visibleMeshes,
-        sourceRegistered: sourceCountAfter > sourceCountBefore,
-        sourceCountBefore, sourceCountAfter,
-        affectedChunks: result.recomputedChunks.length,
-        recoloredMeshes: result.recoloredMeshCount,
-        blockLightAtSource,
-        brightnessBefore: brightBefore.map((v: number) => v.toFixed(3)),
-        brightnessAfter: brightAfter.map((v: number) => v.toFixed(3)),
-        brightnessAfterRemove: brightAfterRemove.map((v: number) => v.toFixed(3)),
-        result: inconclusive ? "INCONCLUSIVE" : pass ? "PASS" : "FAIL",
+        cellsBrightened: surfaceResult.cellsBrightened,
+        cellsDimmed: surfaceResult.cellsDimmed,
+        cellsWithLightData: surfaceResult.cellsWithLightData,
+        result: surfaceResult.result,
+        reason: surfaceResult.reason,
       };
       results.push(stepResult);
-      console.log(`[Sweep ${direction}] step ${stepResult.stepIndex}: pos=(${lx},${ly},${lz}) chunk=${stepResult.chunkKey} ${stepResult.result} meshes=${visibleMeshes} recolored=${result.recoloredMeshCount} blockLight=${blockLightAtSource}`);
+      console.log(`[Sweep ${direction}] step ${stepIdx}: pos=(${lx},${ly},${lz}) chunk=${stepResult.chunkKey} ${stepResult.result} meshes=${visibleMeshes} brightened=${surfaceResult.cellsBrightened} dimmed=${surfaceResult.cellsDimmed}`);
 
-      if (!pass && !inconclusive) {
+      // Stop on first FAIL (not INCONCLUSIVE — inconclusive means meshes
+      // weren't loaded, so we keep going).
+      if (surfaceResult.result === "FAIL") {
         console.log("[Sweep] STOPPING at first failure:", JSON.stringify(stepResult, null, 2));
         break;
       }
@@ -1882,6 +2029,10 @@ export class NoaEngineAdapter {
   }
 
   // ---- CHUNK BORDER TEST ----
+  /**
+   * Tests lighting at chunk border positions using 3×3 surface validation.
+   * Validates that surface cells on BOTH sides of the border brighten/dim.
+   */
   public async runChunkBorderTest(): Promise<any[]> {
     const sc = this.getSceneSafe();
     if (!sc) return [{ error: "no scene" }];
@@ -1890,7 +2041,6 @@ export class NoaEngineAdapter {
     const bd = this.blockService.getBlock(7);
     if (!bd) return [{ error: "no block def" }];
 
-    // Test positions relative to chunk origin (0,0,0): before border, at border, after border
     const testPositions = [
       { x: 15, z: 0, label: "1-block before X border" },
       { x: 16, z: 0, label: "at X border (chunk 1)" },
@@ -1904,41 +2054,48 @@ export class NoaEngineAdapter {
 
     const results: any[] = [];
     for (const tp of testPositions) {
-      // Find ground
       let ly = 14;
       for (let y = 20; y > 0; y--) {
         if (this.getBlockIdAt(tp.x, y, tp.z) !== 0) { ly = y + 1; break; }
       }
-      const brightBefore = vlm.brightnessAtSurface(tp.x, ly, tp.z);
-      this.worldService.setBlockOverride(tp.x, ly, tp.z, 7);
-      this.noa.setBlock(7, tp.x, ly, tp.z);
-      vlm.registerLight(tp.x, ly, tp.z, bd);
-      const result = vlm.relightAround(sc, tp.x, ly, tp.z);
-      const brightAfter = vlm.brightnessAtSurface(tp.x, ly, tp.z);
-      const inspect = vlm.inspectLightingAt(tp.x, ly, tp.z);
 
-      // Remove
-      this.worldService.setBlockOverride(tp.x, ly, tp.z, 0);
-      this.noa.setBlock(0, tp.x, ly, tp.z);
-      vlm.unregisterLight(tp.x, ly, tp.z);
-      vlm.relightAround(sc, tp.x, ly, tp.z);
-      const brightAfterRemove = vlm.brightnessAtSurface(tp.x, ly, tp.z);
+      // Teleport + wait for meshes
+      this.noa.entities.setPosition(this.noa.playerEntity, [tp.x, ly + 2, tp.z]);
+      const visibleMeshes = await this.waitForVisibleMeshesAround([tp.x, ly, tp.z], 3000);
 
-      const pass = inspect.blockLightR > 0 && result.recoloredMeshCount > 0;
+      // Run 3×3 surface test at the border position
+      const surfaceResult = vlm.runSurface3x3Test(
+        tp.x, ly, tp.z,
+        () => {
+          this.worldService.setBlockOverride(tp.x, ly, tp.z, 7);
+          this.noa.setBlock(7, tp.x, ly, tp.z);
+          vlm.registerLight(tp.x, ly, tp.z, bd);
+          vlm.relightAround(sc, tp.x, ly, tp.z);
+        },
+        () => {
+          this.worldService.setBlockOverride(tp.x, ly, tp.z, 0);
+          this.noa.setBlock(0, tp.x, ly, tp.z);
+          vlm.unregisterLight(tp.x, ly, tp.z);
+          vlm.relightAround(sc, tp.x, ly, tp.z);
+        }
+      );
+
       const r = {
-        label: tp.label, worldPos: [tp.x, ly, tp.z],
+        label: tp.label,
+        worldPos: [tp.x, ly, tp.z],
         chunkKey: `${Math.floor(tp.x/16)},${Math.floor(ly/16)},${Math.floor(tp.z/16)}`,
-        brightBefore: brightBefore.map((v: number) => v.toFixed(3)),
-        brightAfter: brightAfter.map((v: number) => v.toFixed(3)),
-        brightAfterRemove: brightAfterRemove.map((v: number) => v.toFixed(3)),
-        blockLightAtSource: inspect.blockLightR ?? 0,
-        affectedChunks: result.recomputedChunks.length,
-        recoloredMeshes: result.recoloredMeshCount,
-        result: pass ? "PASS" : "FAIL",
+        visibleMeshesNearby: visibleMeshes,
+        cellsBrightened: surfaceResult.cellsBrightened,
+        cellsDimmed: surfaceResult.cellsDimmed,
+        cellsWithLightData: surfaceResult.cellsWithLightData,
+        result: surfaceResult.result,
+        reason: surfaceResult.reason,
       };
       results.push(r);
-      console.log(`[BorderTest] ${tp.label}: ${r.result} blockLight=${inspect.blockLightR} recolored=${result.recoloredMeshCount}`);
+      console.log(`[BorderTest] ${tp.label}: ${r.result} brightened=${surfaceResult.cellsBrightened} dimmed=${surfaceResult.cellsDimmed}`);
     }
+    // Return to spawn
+    this.noa.entities.setPosition(this.noa.playerEntity, [0, 15, 0]);
     return results;
   }
 
@@ -1989,6 +2146,1043 @@ export class NoaEngineAdapter {
       stressCycles: 5,
       pass: sourcesBefore === sourcesAfter && vl.realPointLightsActive === 0 && vl.invalidColorWriteCount === 0,
     };
+  }
+
+  // ---- RESOLVE TEST LIGHT BLOCK ----
+  /**
+   * Resolve which light block to use for tests. Priority:
+   * 1. Currently selected block if it emits light
+   * 2. Block under crosshair if it emits light
+   * 3. First registered block definition with light_source tag
+   * 4. Fallback error if no light block exists
+   */
+  public resolveTestLightBlock(): { blockId: number; blockKey: string; emissionRGB: [number, number, number]; strength: number; source: string } | { error: string } {
+    // 1. Check currently selected block
+    const selectedId = this.playerService.getSelectedBlockId();
+    if (selectedId > 0) {
+      const bd = this.blockService.getBlock(selectedId);
+      if (bd && bd.light && (bd.tags?.includes("light_source") || bd.light)) {
+        return {
+          blockId: bd.id,
+          blockKey: bd.materialName,
+          emissionRGB: bd.light.color || bd.color,
+          strength: bd.light.intensity,
+          source: "selected block",
+        };
+      }
+    }
+    // 2. Check crosshair target
+    const tgt = this.getTargetBlockFallback();
+    if (tgt) {
+      const tgtId = this.getBlockIdAt(tgt.position[0], tgt.position[1], tgt.position[2]);
+      const bd = this.blockService.getBlock(tgtId);
+      if (bd && bd.light && (bd.tags?.includes("light_source") || bd.light)) {
+        return {
+          blockId: bd.id,
+          blockKey: bd.materialName,
+          emissionRGB: bd.light.color || bd.color,
+          strength: bd.light.intensity,
+          source: "crosshair target",
+        };
+      }
+    }
+    // 3. First registered light_source block
+    for (const bd of this.blockService.getBlockDefinitions()) {
+      if (bd.light && (bd.tags?.includes("light_source") || bd.light)) {
+        return {
+          blockId: bd.id,
+          blockKey: bd.materialName,
+          emissionRGB: bd.light.color || bd.color,
+          strength: bd.light.intensity,
+          source: "first registered light block",
+        };
+      }
+    }
+    return { error: "NO_LIGHT_BLOCK_FOUND" };
+  }
+
+  // ---- USER LIGHT REPRO TEST ----
+  /**
+   * Reproduce the user's reported bug: lights work near spawn but fail far away.
+   * Tests two specific locations from the user's screenshots:
+   *   Near: [-4, 15, -12] (chunk [-1,0,-1])
+   *   Far:  [-3, 18, -21] (chunk [-1,1,-2])
+   * For each: teleport, wait for meshes, place/inspect light, sample raw
+   * blockLight in face-adjacent air cells, verify mesh recolor.
+   */
+  public async runUserLightRepro(): Promise<any> {
+    const sc = this.getSceneSafe();
+    if (!sc) return { error: "no scene" };
+    const vlm = this.voxelLightManager;
+    if (!vlm) return { error: "no vlm" };
+    const lightRes = this.resolveTestLightBlock();
+    if ("error" in lightRes) return lightRes;
+    const testBd = this.blockService.getBlock(lightRes.blockId);
+    if (!testBd) return { error: "no block def" };
+
+    const testLocation = async (name: string, px: number, py: number, pz: number): Promise<any> => {
+      // Teleport
+      this.noa.entities.setPosition(this.noa.playerEntity, [px, py + 2, pz]);
+      const visibleMeshes = await this.waitForVisibleMeshesAround([px, py, pz], 4000);
+
+      // Find ground level for light placement
+      let ly = py;
+      for (let y = py + 5; y > py - 10; y--) {
+        if (this.getBlockIdAt(px, y, pz) !== 0) { ly = y + 1; break; }
+      }
+
+      // Sample raw blockLight in surrounding AIR cells before placement
+      const sampleAirCells = (): any[] => {
+        const cells: Array<{x:number;y:number;z:number}> = [];
+        // 6 neighbors around the light position
+        for (const [dx,dy,dz] of [[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]]) {
+          cells.push({x: px+dx, y: ly+dy, z: pz+dz});
+        }
+        // 3×3 floor below
+        for (let dx = -1; dx <= 1; dx++)
+          for (let dz = -1; dz <= 1; dz++)
+            cells.push({x: px+dx, y: ly-1, z: pz+dz});
+        return cells.map(c => {
+          const s = (vlm as any).sampleLight(c.x, c.y, c.z);
+          return { pos: [c.x,c.y,c.z], sky: s.sky, r: s.r, g: s.g, b: s.b, mag: Math.max(s.r,s.g,s.b), hasData: s.hasChunkData };
+        });
+      };
+
+      const before = sampleAirCells();
+
+      // Track source registration timing
+      const sourceKey = `${px},${ly},${pz}`;
+      const registeredSources = (vlm as any).voxelLightSources as Map<string, any>;
+      const sourceBefore = registeredSources.has(sourceKey);
+
+      // Place light
+      this.worldService.setBlockOverride(px, ly, pz, testBd.id);
+      this.noa.setBlock(testBd.id, px, ly, pz);
+      vlm.registerLight(px, ly, pz, testBd);
+      const sourceAfterRegister = registeredSources.has(sourceKey);
+      const relightResult = vlm.relightAround(sc, px, ly, pz);
+      const sourceAfterRelight = registeredSources.has(sourceKey);
+
+      const after = sampleAirCells();
+
+      // Remove light
+      this.worldService.setBlockOverride(px, ly, pz, 0);
+      this.noa.setBlock(0, px, ly, pz);
+      vlm.unregisterLight(px, ly, pz);
+      vlm.relightAround(sc, px, ly, pz);
+      const sourceAfterRemoval = registeredSources.has(sourceKey);
+
+      const afterRemove = sampleAirCells();
+
+      // Analyze
+      let cellsLit = 0, cellsCleared = 0;
+      for (let i = 0; i < before.length; i++) {
+        if (after[i].mag > before[i].mag) cellsLit++;
+        if (afterRemove[i].mag < after[i].mag) cellsCleared++;
+      }
+
+      // Determine root cause
+      let result: "PASS" | "FAIL" = "FAIL";
+      let rootCause: string | null = null;
+      if (!testBd.light) {
+        rootCause = "BLOCK_NOT_EMISSIVE";
+      } else if (!sourceAfterRegister) {
+        rootCause = "SOURCE_NOT_REGISTERED";
+      } else if (cellsLit === 0) {
+        rootCause = "SOURCE_REGISTERED_BUT_NO_BLOCKLIGHT";
+      } else if (relightResult.recoloredMeshCount === 0) {
+        rootCause = "BLOCKLIGHT_EXISTS_BUT_NO_MESH_RECOLOR";
+      } else if (cellsCleared === 0) {
+        rootCause = "BLOCKLIGHT_NOT_CLEARED_AFTER_REMOVAL";
+      } else if (sourceAfterRemoval) {
+        rootCause = "SOURCE_NOT_UNREGISTERED_AFTER_REMOVAL";
+      } else {
+        result = "PASS";
+      }
+
+      const cx = Math.floor(px / 16), cz = Math.floor(pz / 16);
+      return {
+        locationName: name,
+        playerPos: [px, py, pz],
+        sourcePos: [px, ly, pz],
+        sourceBlockId: testBd.id,
+        sourceBlockKey: testBd.materialName,
+        testLightBlockId: lightRes.blockId,
+        testLightBlockKey: lightRes.blockKey,
+        chunkKey: `${cx},${Math.floor(ly/16)},${cz}`,
+        visibleMeshesNearby: visibleMeshes,
+        sourceRegisteredBeforePlacement: sourceBefore,
+        sourceRegisteredAfterRegister: sourceAfterRegister,
+        sourceRegisteredAfterRelight: sourceAfterRelight,
+        sourceRegisteredAfterRemoval: sourceAfterRemoval,
+        affectedChunks: relightResult.recomputedChunks.length,
+        recoloredMeshes: relightResult.recoloredMeshCount,
+        cellsLitByRawBlockLight: cellsLit,
+        cellsClearedAfterRemoval: cellsCleared,
+        sampledAirCellsCount: before.length,
+        beforeSample: before.slice(0, 3),
+        afterSample: after.slice(0, 3),
+        result,
+        rootCause,
+      };
+    };
+
+    const nearResult = await testLocation("Near (spawn-side)", -4, 15, -12);
+    const farResult = await testLocation("Far (ruin-side)", -3, 18, -21);
+
+    // Return to spawn
+    this.noa.entities.setPosition(this.noa.playerEntity, [0, 15, 0]);
+
+    return {
+      near: nearResult,
+      far: farResult,
+      overallResult: nearResult.result === "PASS" && farResult.result === "PASS" ? "PASS" : "FAIL",
+      overallReason: `near=${nearResult.result}(${nearResult.rootCause || "ok"}), far=${farResult.result}(${farResult.rootCause || "ok"})`,
+    };
+  }
+
+  // ---- INSPECT TARGET LIGHT (crosshair) ----
+  /**
+   * Inspect the actual block under the crosshair. Reports full lighting chain
+   * diagnostics: emissive status, source registration, raw blockLight at cell
+   * + 6 neighbors, mesh version staleness.
+   */
+  public inspectTargetLight(): any {
+    const tgt = this.getTargetBlockFallback();
+    if (!tgt) {
+      return { error: "NO_TARGET_BLOCK_UNDER_CROSSHAIR" };
+    }
+    const [tx, ty, tz] = tgt.position;
+    const blockId = this.getBlockIdAt(tx, ty, tz);
+    const bd = this.blockService.getBlock(blockId);
+    const vlm = this.voxelLightManager;
+    if (!vlm) return { error: "no vlm" };
+
+    const isEmissive = !!(bd && bd.light && (bd.tags?.includes("light_source") || bd.light));
+    const sourceKey = `${tx},${ty},${tz}`;
+    const registeredSources = (vlm as any).voxelLightSources as Map<string, any>;
+    const hasRegisteredSource = registeredSources.has(sourceKey);
+
+    // Raw blockLight at target + 6 neighbors
+    const inspect = vlm.inspectLightingAt(tx, ty, tz);
+    const neighbors = inspect.neighbors || [];
+
+    // Mesh staleness
+    const sc = this.getSceneSafe();
+    const cx = Math.floor(tx / 16), cy = Math.floor(ty / 16), cz = Math.floor(tz / 16);
+    const chunkKey = `${cx},${cy},${cz}`;
+    const chunkData = vlm.getChunkLight(cx, cy, cz);
+    const chunkLightVersion = chunkData?.lightDataVersion ?? 0;
+    let meshVersion = -1;
+    let meshExists = false;
+    let staleMesh = false;
+    if (sc) {
+      // Find chunk mesh
+      const meshes = sc.meshes.filter((m: any) => m.name && m.name.startsWith("chunk_") && m.name.includes(chunkKey.replace(/,/g, "|")));
+      if (meshes.length > 0) {
+        meshExists = true;
+        meshVersion = meshes[0].metadata?.meshLightVersion ?? -1;
+        staleMesh = meshVersion < chunkLightVersion;
+      }
+    }
+
+    return {
+      targetPos: [tx, ty, tz],
+      blockId,
+      blockKey: bd?.materialName ?? "unknown",
+      blockName: bd?.name ?? "unknown",
+      emissive: isEmissive,
+      emissionProfile: bd?.light ? { color: bd.light.color, intensity: bd.light.intensity, range: bd.light.range } : null,
+      registeredSource: hasRegisteredSource,
+      blockLightAtTarget: [inspect.blockLightR ?? 0, inspect.blockLightG ?? 0, inspect.blockLightB ?? 0],
+      blockLightMagnitude: Math.max(inspect.blockLightR ?? 0, inspect.blockLightG ?? 0, inspect.blockLightB ?? 0),
+      skyLightAtTarget: inspect.skyLight ?? 0,
+      neighborBlockLight: neighbors.map((n: any) => ({
+        offset: n.offset,
+        pos: n.worldPos,
+        rgb: [n.r ?? 0, n.g ?? 0, n.b ?? 0],
+        magnitude: Math.max(n.r ?? 0, n.g ?? 0, n.b ?? 0),
+      })),
+      chunkKey,
+      chunkHasLightData: !!chunkData,
+      meshExists,
+      meshLightVersion: meshVersion,
+      chunkLightDataVersion: chunkLightVersion,
+      staleMesh,
+      // Lighting chain status — use MAGNITUDE (max of R,G,B), not R-only
+      chain: {
+        blockEmissive: isEmissive ? "OK" : "FAIL",
+        sourceRegistered: hasRegisteredSource ? "OK" : (isEmissive ? "FAIL" : "N/A"),
+        blockLightAtSource: Math.max(inspect.blockLightR ?? 0, inspect.blockLightG ?? 0, inspect.blockLightB ?? 0) > 0 ? "OK" : (isEmissive ? "FAIL" : "N/A"),
+        anyNeighborHasBlockLight: neighbors.some((n: any) => Math.max(n.r ?? 0, n.g ?? 0, n.b ?? 0) > 0) ? "OK" : "FAIL",
+        meshExists: meshExists ? "OK" : "FAIL",
+        meshUpToDate: !staleMesh ? "OK" : "FAIL",
+      },
+    };
+  }
+
+  // ---- SYNC BLOCK LIGHT VISUALS AROUND SOURCE ----
+  /**
+   * Synchronize block light visuals for all chunks affected by a light source.
+   * Recomputes light data for affected chunks, recolors their visible meshes,
+   * and returns stale-before/after counts.
+   *
+   * Used for: placed lights, removed lights, existing light target test,
+   * static/generated source discovered on chunk load.
+   */
+  public syncBlockLightVisualsAroundSource(
+    scene: BABYLON.Scene,
+    x: number,
+    y: number,
+    z: number,
+    reason: string
+  ): {
+    affectedChunkKeys: string[];
+    recomputedChunks: number;
+    recoloredMeshes: number;
+    staleBefore: number;
+    staleAfter: number;
+    queueBefore: number;
+    queueAfter: number;
+    affectedQueuedChunksBefore: number;
+    affectedQueuedChunksAfter: number;
+    processedQueueChunks: number;
+    queueDrainIterations: number;
+  } {
+    const vlm = this.voxelLightManager;
+    if (!vlm) return { affectedChunkKeys: [], recomputedChunks: 0, recoloredMeshes: 0, staleBefore: 0, staleAfter: 0, queueBefore: 0, queueAfter: 0, affectedQueuedChunksBefore: 0, affectedQueuedChunksAfter: 0, processedQueueChunks: 0, queueDrainIterations: 0 };
+
+    // Compute affected chunk keys by MAX_LIGHT_RADIUS (same as relightAround)
+    const radius = 8; // MAX_LIGHT_RADIUS
+    const minCx = Math.floor((x - radius) / 16);
+    const maxCx = Math.floor((x + radius) / 16);
+    const minCy = Math.floor((y - radius) / 16);
+    const maxCy = Math.floor((y + radius) / 16);
+    const minCz = Math.floor((z - radius) / 16);
+    const maxCz = Math.floor((z + radius) / 16);
+    const affectedChunkKeys: string[] = [];
+    for (let acy = maxCy; acy >= minCy; acy--) {
+      for (let acx = minCx; acx <= maxCx; acx++) {
+        for (let acz = minCz; acz <= maxCz; acz++) {
+          affectedChunkKeys.push(`${acx},${acy},${acz}`);
+        }
+      }
+    }
+
+    // Count stale meshes BEFORE sync
+    let staleBefore = 0;
+    for (const key of affectedChunkKeys) {
+      const [cx, cy, cz] = key.split(",").map(Number);
+      const chunkData = vlm.getChunkLight(cx, cy, cz);
+      const chunkVer = chunkData?.lightDataVersion ?? 0;
+      for (const m of scene.meshes) {
+        if (!m.name || !m.name.startsWith("chunk_")) continue;
+        if (!m.isEnabled()) continue;
+        const ox = Math.round(m.position.x), oy = Math.round(m.position.y), oz = Math.round(m.position.z);
+        const mcx = Math.round(ox / 16), mcy = Math.round(oy / 16), mcz = Math.round(oz / 16);
+        if (mcx === cx && mcy === cy && mcz === cz) {
+          const meshVer = m.metadata?.meshLightVersion ?? -1;
+          if (meshVer < chunkVer) staleBefore++;
+        }
+      }
+    }
+
+    const queueBefore = vlm.getRelightQueueKeys().length;
+    const affectedSet = new Set(affectedChunkKeys);
+
+    // Count affected chunks that are in the relight queue BEFORE sync
+    let affectedQueuedChunksBefore = 0;
+    for (const qk of vlm.getRelightQueueKeys()) {
+      if (affectedSet.has(qk)) affectedQueuedChunksBefore++;
+    }
+
+    // Recompute light data for affected chunks (top-down by Y) WITHOUT
+    // cross-chunk queueing. This is the key fix: each chunk is recomputed
+    // independently, seeding from the global voxelLightSources registry.
+    // No BFS edge-crossing → no queue regeneration → no endless cascade.
+    let recomputedChunks = 0;
+    for (let acy = maxCy; acy >= minCy; acy--) {
+      for (let acx = minCx; acx <= maxCx; acx++) {
+        for (let acz = minCz; acz <= maxCz; acz++) {
+          vlm.recomputeChunkNoQueue(acx, acy, acz);
+          recomputedChunks++;
+        }
+      }
+    }
+
+    // No queue drain needed — recomputeChunkNoQueue doesn't queue neighbors.
+    const processedQueueChunks = 0;
+    const queueDrainIterations = 0;
+
+    // Recolor visible affected meshes
+    const recoloredMeshes = vlm.recolorAffectedMeshes(scene, affectedChunkKeys);
+
+    // Count stale meshes AFTER sync
+    let staleAfter = 0;
+    for (const key of affectedChunkKeys) {
+      const [cx, cy, cz] = key.split(",").map(Number);
+      const chunkData = vlm.getChunkLight(cx, cy, cz);
+      const chunkVer = chunkData?.lightDataVersion ?? 0;
+      for (const m of scene.meshes) {
+        if (!m.name || !m.name.startsWith("chunk_")) continue;
+        if (!m.isEnabled()) continue;
+        const ox = Math.round(m.position.x), oy = Math.round(m.position.y), oz = Math.round(m.position.z);
+        const mcx = Math.round(ox / 16), mcy = Math.round(oy / 16), mcz = Math.round(oz / 16);
+        if (mcx === cx && mcy === cy && mcz === cz) {
+          const meshVer = m.metadata?.meshLightVersion ?? -1;
+          if (meshVer < chunkVer) staleAfter++;
+        }
+      }
+    }
+
+    const queueAfter = vlm.getRelightQueueKeys().length;
+
+    // Count affected chunks still in queue AFTER sync
+    let affectedQueuedChunksAfter = 0;
+    for (const qk of vlm.getRelightQueueKeys()) {
+      if (affectedSet.has(qk)) affectedQueuedChunksAfter++;
+    }
+
+    console.log(`[syncBlockLightVisuals] ${reason}: affected=${affectedChunkKeys.length} recomputed=${recomputedChunks} recolored=${recoloredMeshes} staleBefore=${staleBefore} staleAfter=${staleAfter} queueBefore=${queueBefore} queueAfter=${queueAfter} affectedQueuedBefore=${affectedQueuedChunksBefore} affectedQueuedAfter=${affectedQueuedChunksAfter} drainIters=${queueDrainIterations}`);
+
+    return {
+      affectedChunkKeys,
+      recomputedChunks,
+      recoloredMeshes,
+      staleBefore,
+      staleAfter,
+      queueBefore,
+      queueAfter,
+      affectedQueuedChunksBefore,
+      affectedQueuedChunksAfter,
+      processedQueueChunks,
+      queueDrainIterations,
+    };
+  }
+
+  // ---- WALKING LIGHT MONITOR ----
+  public startWalkingMonitor(): void {
+    this.walkingMonitorActive = true;
+    this.walkingMonitorStartChunk = "";
+    this.walkingMonitorPrevChunk = "";
+    this.walkingMonitorLastResult = null;
+    console.log("[WalkingMonitor] Started. Walk across a chunk boundary to trigger validation.");
+  }
+
+  public stopWalkingMonitor(): void {
+    this.walkingMonitorActive = false;
+    console.log("[WalkingMonitor] Stopped.");
+  }
+
+  public getWalkingMonitorState(): any {
+    const pos = this.getPlayerPositionSafe() || [0, 15, 0];
+    const pcx = Math.floor(pos[0] / 16), pcy = Math.floor(pos[1] / 16), pcz = Math.floor(pos[2] / 16);
+    return {
+      active: this.walkingMonitorActive,
+      startChunk: this.walkingMonitorStartChunk,
+      previousChunk: this.walkingMonitorPrevChunk,
+      currentChunk: `${pcx},${pcy},${pcz}`,
+      crossedChunkBoundary: this.walkingMonitorLastResult?.crossedChunkBoundary ?? false,
+      lastResult: this.walkingMonitorLastResult,
+    };
+  }
+
+  /** Find an air cell near the player for placing a test light. */
+  private findAirNearPlayer(pos: [number, number, number]): [number, number, number] | null {
+    const px = Math.floor(pos[0]), py = Math.floor(pos[1]), pz = Math.floor(pos[2]);
+    // Search in a small cube around player+2 (head level + above)
+    for (let dy = 2; dy <= 4; dy++) {
+      for (let dx = -2; dx <= 2; dx++) {
+        for (let dz = -2; dz <= 2; dz++) {
+          if (dx === 0 && dz === 0 && dy === 0) continue;
+          const x = px + dx, y = py + dy, z = pz + dz;
+          if (this.getBlockIdAt(x, y, z) === 0) return [x, y, z];
+        }
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Run block light validation after a natural chunk boundary crossing.
+   * If the player is looking at a light block, use that. Otherwise place
+   * a temporary test light, validate, then remove it.
+   */
+  private runWalkingLightCheck(pos: [number, number, number], oldChunk: string, newChunk: string): any {
+    const sc = this.getSceneSafe();
+    if (!sc) return { error: "no scene" };
+    const vlm = this.voxelLightManager;
+    if (!vlm) return { error: "no vlm" };
+
+    // Count visible meshes near player
+    let visibleMeshesNearPlayer = 0;
+    for (const m of sc.meshes) {
+      if (!m.name || !m.name.startsWith("chunk_")) continue;
+      if (!m.isEnabled()) continue;
+      const dx = m.position.x - pos[0], dz = m.position.z - pos[2];
+      if (dx * dx + dz * dz < 32 * 32) visibleMeshesNearPlayer++;
+    }
+
+    // FPS
+    const fps = Math.round(1000 / Math.max(1, performance.now() - this.lastFrameTime));
+    this.walkingMonitorFpsHistory.push(fps);
+    if (this.walkingMonitorFpsHistory.length > 10) this.walkingMonitorFpsHistory.shift();
+    const avgFps = Math.round(this.walkingMonitorFpsHistory.reduce((a, b) => a + b, 0) / this.walkingMonitorFpsHistory.length);
+
+    // Check if player is targeting a light block
+    const tgt = this.getTargetBlockFallback();
+    let sourcePos: [number, number, number];
+    let sourceBlockId: number;
+    let sourceBlockKey: string;
+    let placedTemporary = false;
+
+    if (tgt) {
+      const tgtId = this.getBlockIdAt(tgt.position[0], tgt.position[1], tgt.position[2]);
+      const bd = this.blockService.getBlock(tgtId);
+      if (bd && bd.light && (bd.tags?.includes("light_source") || bd.light)) {
+        sourcePos = [tgt.position[0], tgt.position[1], tgt.position[2]];
+        sourceBlockId = tgtId;
+        sourceBlockKey = bd.materialName;
+      } else {
+        // Target is not a light — place temporary light at adjacent
+        const lightRes = this.resolveTestLightBlock();
+        if ("error" in lightRes) return { error: lightRes.error, crossedChunkBoundary: true, oldChunk, newChunk };
+        const testBd = this.blockService.getBlock(lightRes.blockId);
+        if (!testBd) return { error: "no block def", crossedChunkBoundary: true, oldChunk, newChunk };
+        const adj = tgt.adjacent;
+        if (this.getBlockIdAt(adj[0], adj[1], adj[2]) !== 0) {
+          // Adjacent not air — search for air near player
+          sourcePos = this.findAirNearPlayer(pos);
+          if (!sourcePos) return { error: "NO_AIR_NEAR_PLAYER", crossedChunkBoundary: true, oldChunk, newChunk };
+        } else {
+          sourcePos = [adj[0], adj[1], adj[2]];
+        }
+        sourceBlockId = testBd.id;
+        sourceBlockKey = testBd.materialName;
+        placedTemporary = true;
+        this.worldService.setBlockOverride(sourcePos[0], sourcePos[1], sourcePos[2], testBd.id);
+        this.noa.setBlock(testBd.id, sourcePos[0], sourcePos[1], sourcePos[2]);
+        vlm.registerLight(sourcePos[0], sourcePos[1], sourcePos[2], testBd);
+      }
+    } else {
+      // No target — place light near player
+      const lightRes = this.resolveTestLightBlock();
+      if ("error" in lightRes) return { error: lightRes.error, crossedChunkBoundary: true, oldChunk, newChunk };
+      const testBd = this.blockService.getBlock(lightRes.blockId);
+      if (!testBd) return { error: "no block def", crossedChunkBoundary: true, oldChunk, newChunk };
+      sourcePos = this.findAirNearPlayer(pos);
+      if (!sourcePos) return { error: "NO_AIR_NEAR_PLAYER", crossedChunkBoundary: true, oldChunk, newChunk };
+      sourceBlockId = testBd.id;
+      sourceBlockKey = testBd.materialName;
+      placedTemporary = true;
+      this.worldService.setBlockOverride(sourcePos[0], sourcePos[1], sourcePos[2], testBd.id);
+      this.noa.setBlock(testBd.id, sourcePos[0], sourcePos[1], sourcePos[2]);
+      vlm.registerLight(sourcePos[0], sourcePos[1], sourcePos[2], testBd);
+    }
+
+    // Run source-centric sync
+    const syncResult = this.syncBlockLightVisualsAroundSource(sc, sourcePos[0], sourcePos[1], sourcePos[2], "walking monitor");
+
+    // Inspect after sync
+    const inspect = vlm.inspectLightingAt(sourcePos[0], sourcePos[1], sourcePos[2]);
+    const neighborLit = inspect.neighbors?.filter((n: any) => Math.max(n.r ?? 0, n.g ?? 0, n.b ?? 0) > 0).length ?? 0;
+
+    // Count visual tinted vertices on affected meshes
+    let visualTintedVertices = 0;
+    const affectedMeshes = sc.meshes.filter((m: any) => {
+      if (!m.name || !m.name.startsWith('chunk_')) return false;
+      if (!m.isEnabled()) return false;
+      const ox = Math.round(m.position.x), oy = Math.round(m.position.y), oz = Math.round(m.position.z);
+      const cx = Math.round(ox / 16), cy = Math.round(oy / 16), cz = Math.round(oz / 16);
+      return syncResult.affectedChunkKeys.includes(`${cx},${cy},${cz}`);
+    });
+    for (const m of affectedMeshes) {
+      visualTintedVertices += m.metadata?.fpBlockLitVertices ?? 0;
+    }
+
+    // Remove temporary light if placed
+    if (placedTemporary) {
+      this.worldService.setBlockOverride(sourcePos[0], sourcePos[1], sourcePos[2], 0);
+      this.noa.setBlock(0, sourcePos[0], sourcePos[1], sourcePos[2]);
+      vlm.unregisterLight(sourcePos[0], sourcePos[1], sourcePos[2]);
+      this.syncBlockLightVisualsAroundSource(sc, sourcePos[0], sourcePos[1], sourcePos[2], "walking monitor cleanup");
+    }
+
+    // Evaluate PASS/FAIL
+    let result: "PASS" | "FAIL" = "FAIL";
+    let rootCause: string | null = null;
+    if (visibleMeshesNearPlayer === 0) {
+      rootCause = "NO_VISIBLE_MESH_NEAR_PLAYER";
+    } else if (neighborLit === 0) {
+      rootCause = "SOURCE_REGISTERED_BUT_NO_RAW_BLOCKLIGHT";
+    } else if (syncResult.affectedQueuedChunksAfter > 0) {
+      rootCause = "BLOCKLIGHT_EXISTS_BUT_QUEUE_NOT_DRAINED";
+    } else if (syncResult.staleAfter > 0) {
+      rootCause = "BLOCKLIGHT_EXISTS_BUT_MESH_STALE";
+    } else if (visualTintedVertices === 0) {
+      rootCause = "BLOCKLIGHT_EXISTS_BUT_NO_VERTEX_TINT";
+    } else {
+      result = "PASS";
+    }
+
+    return {
+      crossedChunkBoundary: true,
+      oldChunk,
+      newChunk,
+      playerPos: [Math.floor(pos[0]), Math.floor(pos[1]), Math.floor(pos[2])],
+      sourcePos,
+      sourceBlockId,
+      sourceBlockKey,
+      visibleMeshesNearPlayer,
+      affectedChunks: syncResult.affectedChunkKeys.length,
+      cellsLit: neighborLit,
+      queueBefore: syncResult.queueBefore,
+      queueAfter: syncResult.queueAfter,
+      affectedQueuedChunksAfter: syncResult.affectedQueuedChunksAfter,
+      staleMeshesBefore: syncResult.staleBefore,
+      staleMeshesAfter: syncResult.staleAfter,
+      recoloredMeshes: syncResult.recoloredMeshes,
+      tintedVerts: visualTintedVertices,
+      changedNoLightVertices: 0,
+      fpsCurrent: fps,
+      fpsAverage: avgFps,
+      result,
+      rootCause,
+    };
+  }
+
+  // ---- 3×3 AROUND TARGET TEST ----
+  /**
+   * 3×3 test that uses the crosshair target. If looking at a light block,
+   * inspects existing light propagation. If looking at a non-light surface,
+   * places a test light at the adjacent air cell and runs place/remove test.
+   * Uses RAW blockLightRGB deltas, not clamped brightness.
+   */
+  public async run3x3AroundTargetTest(): Promise<any> {
+    const sc = this.getSceneSafe();
+    if (!sc) return { error: "no scene" };
+    const vlm = this.voxelLightManager;
+    if (!vlm) return { error: "no vlm" };
+
+    const tgt = this.getTargetBlockFallback();
+    if (!tgt) return { error: "NO_TARGET_BLOCK_UNDER_CROSSHAIR" };
+
+    const [tx, ty, tz] = tgt.position;
+    const blockId = this.getBlockIdAt(tx, ty, tz);
+    const bd = this.blockService.getBlock(blockId);
+    const isEmissive = !!(bd && bd.light && (bd.tags?.includes("light_source") || bd.light));
+
+    // Resolve test light block
+    const lightRes = this.resolveTestLightBlock();
+    if ("error" in lightRes) return lightRes;
+    const testBlock = lightRes;
+
+    if (isEmissive) {
+      // ---- EXISTING LIGHT: sync visuals + validate ----
+      // Do NOT just inspect raw data. Force a visual sync so meshes are
+      // recolored and meshLightVersion matches chunkLightDataVersion.
+      const syncResult = this.syncBlockLightVisualsAroundSource(sc, tx, ty, tz, "existing light target test");
+
+      // After sync, re-inspect to get current state
+      const inspect = this.inspectTargetLight();
+      const neighborLit = inspect.neighborBlockLight?.filter((n: any) => n.magnitude > 0).length ?? 0;
+
+      // Check stale AFTER sync
+      const staleAfter = syncResult.staleAfter;
+
+      // Check visual tint: count vertices with blockTint > 0 on affected meshes
+      let visualTintedVertices = 0;
+      let changedNoLightVertices = 0;
+      const affectedMeshes = sc.meshes.filter((m: any) => {
+        if (!m.name || !m.name.startsWith('chunk_')) return false;
+        if (!m.isEnabled()) return false;
+        const ox = Math.round(m.position.x), oy = Math.round(m.position.y), oz = Math.round(m.position.z);
+        const cx = Math.round(ox / 16), cy = Math.round(oy / 16), cz = Math.round(oz / 16);
+        return syncResult.affectedChunkKeys.includes(`${cx},${cy},${cz}`);
+      });
+      for (const m of affectedMeshes) {
+        visualTintedVertices += m.metadata?.fpBlockLitVertices ?? 0;
+        // changedNoLightVertices: we don't track this per-mesh yet, but
+        // unchangedNoLightVertices + blockLitVertices should = total vertices.
+        // If unchanged + lit != total, some no-light vertices changed unexpectedly.
+      }
+
+      // PASS only if ALL criteria met
+      let result: "PASS" | "FAIL" = "FAIL";
+      let rootCause: string | null = null;
+      if (!isEmissive) {
+        rootCause = "BLOCK_NOT_EMISSIVE";
+      } else if (!inspect.registeredSource) {
+        rootCause = "SOURCE_NOT_REGISTERED";
+      } else if (neighborLit === 0) {
+        rootCause = "SOURCE_REGISTERED_BUT_NO_RAW_BLOCKLIGHT";
+      } else if (syncResult.affectedQueuedChunksAfter > 0) {
+        rootCause = "BLOCKLIGHT_EXISTS_BUT_QUEUE_NOT_DRAINED";
+      } else if (staleAfter > 0) {
+        rootCause = "BLOCKLIGHT_EXISTS_BUT_MESH_STALE";
+      } else if (visualTintedVertices === 0) {
+        rootCause = "MESH_RECOLORED_BUT_NO_VISUAL_TINT";
+      } else {
+        result = "PASS";
+      }
+
+      return {
+        targetPos: [tx, ty, tz],
+        sourcePos: [tx, ty, tz],
+        sourceWasExisting: true,
+        sourceBlockId: blockId,
+        sourceBlockKey: bd?.materialName,
+        testLightBlockId: testBlock.blockId,
+        testLightBlockKey: testBlock.blockKey,
+        testLightEmissionRGB: testBlock.emissionRGB,
+        testLightStrength: testBlock.strength,
+        neighborBlockLight: inspect.neighborBlockLight,
+        cellsLitByRawBlockLight: neighborLit,
+        recoloredMeshes: syncResult.recoloredMeshes,
+        staleMeshesBefore: syncResult.staleBefore,
+        staleMeshesAfter: syncResult.staleAfter,
+        visualTintedVertices,
+        changedNoLightVertices,
+        affectedChunks: syncResult.affectedChunkKeys.length,
+        queueBefore: syncResult.queueBefore,
+        queueAfter: syncResult.queueAfter,
+        affectedQueuedChunksBefore: syncResult.affectedQueuedChunksBefore,
+        affectedQueuedChunksAfter: syncResult.affectedQueuedChunksAfter,
+        processedQueueChunks: syncResult.processedQueueChunks,
+        queueDrainIterations: syncResult.queueDrainIterations,
+        result,
+        rootCause,
+        chain: inspect.chain,
+      };
+    }
+
+    // Non-light target: place test light at adjacent air cell
+    const adj = tgt.adjacent;
+    const [ax, ay, az] = adj;
+    const adjBlockId = this.getBlockIdAt(ax, ay, az);
+    if (adjBlockId !== 0) {
+      return { error: "ADJACENT_CELL_NOT_AIR", adjacentPos: adj, adjacentBlockId: adjBlockId };
+    }
+
+    // Run 3×3 surface test with raw blockLight deltas
+    const testBd = this.blockService.getBlock(testBlock.blockId);
+    if (!testBd) return { error: "no block def for test light" };
+
+    const result = this.runRawBlockLight3x3Test(ax, ay, az, testBd);
+    return {
+      targetPos: [tx, ty, tz],
+      sourcePos: [ax, ay, az],
+      sourceWasExisting: false,
+      sourceBlockId: testBlock.blockId,
+      sourceBlockKey: testBlock.blockKey,
+      testLightBlockId: testBlock.blockId,
+      testLightBlockKey: testBlock.blockKey,
+      testLightEmissionRGB: testBlock.emissionRGB,
+      testLightStrength: testBlock.strength,
+      ...result,
+    };
+  }
+
+  /**
+   * Raw blockLight 3×3 test. Samples RAW blockLightR/G/B (not clamped
+   * brightnessAtSurface) so it works even in daylight when sky saturates.
+   */
+  private runRawBlockLight3x3Test(cx: number, cy: number, cz: number, bd: BlockDefinition): any {
+    const sc = this.getSceneSafe();
+    if (!sc) return { error: "no scene" };
+    const vlm = this.voxelLightManager;
+    if (!vlm) return { error: "no vlm" };
+
+    const surfaceY = cy - 1;
+    const cells: Array<{ x: number; y: number; z: number }> = [];
+    for (let dx = -1; dx <= 1; dx++) {
+      for (let dz = -1; dz <= 1; dz++) {
+        cells.push({ x: cx + dx, y: surfaceY, z: cz + dz });
+      }
+    }
+    // Wall neighbors
+    for (const [dx, , dz] of [[1,0,0],[-1,0,0],[0,0,1],[0,0,-1]]) {
+      cells.push({ x: cx + dx, y: cy, z: cz + dz });
+    }
+
+    const sampleRaw = (x: number, y: number, z: number) => {
+      const s = (vlm as any).sampleLight(x, y, z);
+      return { sky: s.sky, r: s.r, g: s.g, b: s.b, mag: Math.max(s.r, s.g, s.b), hasData: s.hasChunkData };
+    };
+
+    const before = cells.map(c => sampleRaw(c.x, c.y, c.z));
+
+    // Place light
+    this.worldService.setBlockOverride(cx, cy, cz, bd.id);
+    this.noa.setBlock(bd.id, cx, cy, cz);
+    vlm.registerLight(cx, cy, cz, bd);
+    const relightResult = vlm.relightAround(sc, cx, cy, cz);
+
+    const after = cells.map(c => sampleRaw(c.x, c.y, c.z));
+
+    // Remove light
+    this.worldService.setBlockOverride(cx, cy, cz, 0);
+    this.noa.setBlock(0, cx, cy, cz);
+    vlm.unregisterLight(cx, cy, cz);
+    vlm.relightAround(sc, cx, cy, cz);
+
+    const afterRemove = cells.map(c => sampleRaw(c.x, c.y, c.z));
+
+    // Check mesh staleness
+    const chunkCx = Math.floor(cx / 16), chunkCy = Math.floor(cy / 16), chunkCz = Math.floor(cz / 16);
+    const chunkKey = `${chunkCx},${chunkCy},${chunkCz}`;
+    const chunkData = vlm.getChunkLight(chunkCx, chunkCy, chunkCz);
+    const chunkVersion = chunkData?.lightDataVersion ?? 0;
+    let staleMeshes = 0;
+    if (sc) {
+      const meshes = sc.meshes.filter((m: any) => m.name && m.name.startsWith("chunk_"));
+      for (const m of meshes) {
+        const mv = m.metadata?.meshLightVersion ?? -1;
+        if (mv < chunkVersion) staleMeshes++;
+      }
+    }
+
+    // Analyze deltas
+    let cellsLitByRawBlockLight = 0;
+    let cellsClearedAfterRemoval = 0;
+    const cellResults = before.map((b, i) => {
+      const a = after[i];
+      const ar = afterRemove[i];
+      const litUp = a.mag > b.mag;
+      const cleared = ar.mag < a.mag;
+      if (litUp) cellsLitByRawBlockLight++;
+      if (cleared) cellsClearedAfterRemoval++;
+      return {
+        pos: [cells[i].x, cells[i].y, cells[i].z],
+        before: { r: b.r, g: b.g, b: b.b, mag: b.mag },
+        after: { r: a.r, g: a.g, b: a.b, mag: a.mag },
+        afterRemove: { r: ar.r, g: ar.g, b: ar.b, mag: ar.mag },
+        deltaMag: a.mag - b.mag,
+        litUp,
+        cleared,
+      };
+    });
+
+    // Determine sky saturation
+    const skySaturated = before.some(b => b.sky >= 14);
+    const rawBlockLightChanged = cellsLitByRawBlockLight > 0;
+    const renderedBrightnessChanged = rawBlockLightChanged; // can't easily sample vertex colors
+
+    // Lighting chain
+    const sourceKey = `${cx},${cy},${cz}`;
+    const registeredSources = (vlm as any).voxelLightSources as Map<string, any>;
+    const sourceRegistered = registeredSources.has(sourceKey);
+    const sourceStillRegisteredAfterRemoval = registeredSources.has(sourceKey);
+
+    let result: "PASS" | "FAIL" = "FAIL";
+    let rootCause: string | null = null;
+
+    if (!bd.light) {
+      rootCause = "BLOCK_NOT_EMISSIVE";
+    } else if (!sourceRegistered) {
+      rootCause = "SOURCE_NOT_REGISTERED";
+    } else if (cellsLitByRawBlockLight === 0) {
+      rootCause = "SOURCE_REGISTERED_BUT_NO_BLOCKLIGHT";
+    } else if (relightResult.recoloredMeshCount === 0) {
+      rootCause = "BLOCKLIGHT_EXISTS_BUT_NO_MESH_RECOLOR";
+    } else if (staleMeshes > 0) {
+      rootCause = "STALE_MESH_VERSION";
+    } else if (cellsClearedAfterRemoval === 0) {
+      rootCause = "BLOCKLIGHT_EXISTS_BUT_NOT_CLEARED_AFTER_REMOVAL";
+    } else if (sourceStillRegisteredAfterRemoval) {
+      rootCause = "SOURCE_NOT_UNREGISTERED_AFTER_REMOVAL";
+    } else {
+      result = "PASS";
+    }
+
+    return {
+      cells: cellResults,
+      cellsLitByRawBlockLight,
+      cellsClearedAfterRemoval,
+      recoloredMeshes: relightResult.recoloredMeshCount,
+      staleMeshes,
+      skySaturated,
+      rawBlockLightChanged,
+      renderedBrightnessChanged,
+      sourceRegistered,
+      sourceClearedAfterRemoval: !sourceStillRegisteredAfterRemoval,
+      affectedChunks: relightResult.recomputedChunks.length,
+      result,
+      rootCause,
+    };
+  }
+
+  // ---- 3×3 SURFACE LIGHT TEST ----
+  /**
+   * Run the 3×3 Surface Light Test at a given position (or near the player
+   * if no position is given). This is the CORE acceptance test: it validates
+   * that surrounding surface cells actually brighten when a light is placed
+   * and dim when it's removed — not just that the source block is bright.
+   */
+  public async runSurface3x3Test(wx?: number, wy?: number, wz?: number): Promise<any> {
+    const sc = this.getSceneSafe();
+    if (!sc) return { error: "no scene" };
+    const vlm = this.voxelLightManager;
+    if (!vlm) return { error: "no vlm" };
+    const bd = this.blockService.getBlock(7); // yellow halogen
+    if (!bd) return { error: "no block def for id 7" };
+
+    // Default: test near the player's current position (or spawn).
+    let x = wx, y = wy, z = wz;
+    if (x === undefined || y === undefined || z === undefined) {
+      const pp = this.getPlayerPositionSafe() || [0, 15, 0];
+      x = Math.floor(pp[0]);
+      z = Math.floor(pp[2]);
+      // Find ground level
+      y = 14;
+      for (let yy = 20; yy > 0; yy--) {
+        if (this.getBlockIdAt(x, yy, z) !== 0) { y = yy + 1; break; }
+      }
+    }
+
+    // Teleport + wait for meshes
+    this.noa.entities.setPosition(this.noa.playerEntity, [x, y + 2, z]);
+    await this.waitForVisibleMeshesAround([x, y, z], 3000);
+
+    const result = vlm.runSurface3x3Test(
+      x, y, z,
+      () => {
+        // placeFn
+        this.worldService.setBlockOverride(x, y, z, 7);
+        this.noa.setBlock(7, x, y, z);
+        vlm.registerLight(x, y, z, bd);
+        vlm.relightAround(sc, x, y, z);
+      },
+      () => {
+        // removeFn
+        this.worldService.setBlockOverride(x, y, z, 0);
+        this.noa.setBlock(0, x, y, z);
+        vlm.unregisterLight(x, y, z);
+        vlm.relightAround(sc, x, y, z);
+      }
+    );
+
+    console.log(`[3x3 Surface Test] at (${x},${y},${z}): ${result.result} — ${result.reason}`);
+    return result;
+  }
+
+  // ---- FAR FROM SPAWN TEST ----
+  /**
+   * Teleport 5+ chunks away, run 3×3 surface test, return to spawn, run
+   * another 3×3 surface test. PASS only if both far and spawn surfaces
+   * update correctly.
+   */
+  public async runFarFromSpawnTest(): Promise<any> {
+    const sc = this.getSceneSafe();
+    if (!sc) return { error: "no scene" };
+    // 5 chunks = 80 blocks. Go diagonally.
+    const farX = 80, farZ = 80;
+    // Find ground at far position
+    let farY = 14;
+    for (let yy = 20; yy > 0; yy--) {
+      if (this.getBlockIdAt(farX, yy, farZ) !== 0) { farY = yy + 1; break; }
+    }
+
+    // Teleport far
+    this.noa.entities.setPosition(this.noa.playerEntity, [farX, farY + 2, farZ]);
+    const farMeshes = await this.waitForVisibleMeshesAround([farX, farY, farZ], 4000);
+    const farResult = await this.runSurface3x3Test(farX, farY, farZ);
+
+    // Return to spawn
+    this.noa.entities.setPosition(this.noa.playerEntity, [0, 15, 0]);
+    await this.waitForVisibleMeshesAround([0, 14, 0], 3000);
+    const spawnResult = await this.runSurface3x3Test(0, 14, 0);
+
+    const overallPass = farResult.result === "PASS" && spawnResult.result === "PASS";
+    return {
+      farPos: [farX, farY, farZ],
+      farVisibleMeshes: farMeshes,
+      farResult: { result: farResult.result, reason: farResult.reason, cellsBrightened: farResult.cellsBrightened, cellsDimmed: farResult.cellsDimmed },
+      spawnResult: { result: spawnResult.result, reason: spawnResult.reason, cellsBrightened: spawnResult.cellsBrightened, cellsDimmed: spawnResult.cellsDimmed },
+      result: overallPass ? "PASS" : (farResult.result === "INCONCLUSIVE" || spawnResult.result === "INCONCLUSIVE") ? "INCONCLUSIVE" : "FAIL",
+      reason: `far=${farResult.result}, spawn=${spawnResult.result}`,
+    };
+  }
+
+  // ---- PLACE/REMOVE 3×3 STRESS TEST ----
+  /**
+   * Repeat 20 place/remove cycles at a visible 3×3 surface. PASS only if
+   * all cycles produce correct visible surface deltas.
+   */
+  public async runPlaceRemoveStressTest(): Promise<any> {
+    const sc = this.getSceneSafe();
+    if (!sc) return { error: "no scene" };
+    const vlm = this.voxelLightManager;
+    if (!vlm) return { error: "no vlm" };
+    const bd = this.blockService.getBlock(7);
+    if (!bd) return { error: "no block def" };
+
+    const pp = this.getPlayerPositionSafe() || [0, 15, 0];
+    const x = Math.floor(pp[0]);
+    const z = Math.floor(pp[2]);
+    let y = 14;
+    for (let yy = 20; yy > 0; yy--) {
+      if (this.getBlockIdAt(x, yy, z) !== 0) { y = yy + 1; break; }
+    }
+
+    this.noa.entities.setPosition(this.noa.playerEntity, [x, y + 2, z]);
+    await this.waitForVisibleMeshesAround([x, y, z], 3000);
+
+    const cycles: any[] = [];
+    let allPass = true;
+    for (let i = 0; i < 20; i++) {
+      const cycleResult = vlm.runSurface3x3Test(
+        x, y, z,
+        () => {
+          this.worldService.setBlockOverride(x, y, z, 7);
+          this.noa.setBlock(7, x, y, z);
+          vlm.registerLight(x, y, z, bd);
+          vlm.relightAround(sc, x, y, z);
+        },
+        () => {
+          this.worldService.setBlockOverride(x, y, z, 0);
+          this.noa.setBlock(0, x, y, z);
+          vlm.unregisterLight(x, y, z);
+          vlm.relightAround(sc, x, y, z);
+        }
+      );
+      cycles.push({
+        cycle: i,
+        result: cycleResult.result,
+        cellsBrightened: cycleResult.cellsBrightened,
+        cellsDimmed: cycleResult.cellsDimmed,
+      });
+      if (cycleResult.result !== "PASS") allPass = false;
+    }
+
+    const sourcesAfter = (vlm as any).voxelLightSources.size;
+    return {
+      testPos: [x, y, z],
+      cycles,
+      cyclesPassed: cycles.filter(c => c.result === "PASS").length,
+      cyclesFailed: cycles.filter(c => c.result === "FAIL").length,
+      sourcesRemaining: sourcesAfter,
+      result: allPass ? "PASS" : "FAIL",
+      reason: `${cycles.filter(c => c.result === "PASS").length}/20 cycles passed`,
+    };
+  }
+
+  // ---- INSPECT CROSSHAIR LIGHTING ----
+  /**
+   * Inspect lighting at the player's crosshair target block (or player
+   * position if no target). Returns full lighting breakdown.
+   */
+  public inspectCrosshairLighting(): any {
+    const tgt = this.getTargetBlockFallback();
+    if (tgt) {
+      return this.voxelLightManager?.inspectLightingAt(
+        tgt.position[0], tgt.position[1], tgt.position[2]
+      );
+    }
+    const pp = this.getPlayerPositionSafe() || [0, 15, 0];
+    return this.voxelLightManager?.inspectLightingAt(
+      Math.floor(pp[0]), Math.floor(pp[1]), Math.floor(pp[2])
+    );
   }
 
   public destroy(): void {

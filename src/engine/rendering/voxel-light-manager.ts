@@ -70,6 +70,33 @@ export interface VoxelLightSource {
   b: number; // 0-1
 }
 
+/** Result of a single cell in the 3×3 surface light test. */
+export interface SurfaceTestCellResult {
+  worldPos: [number, number, number];
+  blockId: number;
+  chunkKey: string;
+  localCell: [number, number, number];
+  hasLightData: boolean;
+  brightnessBefore: [number, number, number];
+  brightnessAfter: [number, number, number];
+  brightnessAfterRemove: [number, number, number];
+  deltaPlace: [number, number, number];
+  deltaRemove: [number, number, number];
+  brightenedOnPlace: boolean;
+  dimmedOnRemove: boolean;
+}
+
+/** Result of the 3×3 surface light test. */
+export interface SurfaceTestResult {
+  centerPos: [number, number, number];
+  cells: SurfaceTestCellResult[];
+  cellsBrightened: number;
+  cellsDimmed: number;
+  cellsWithLightData: number;
+  result: "PASS" | "FAIL" | "INCONCLUSIVE";
+  reason: string;
+}
+
 export interface VoxelLightDebugInfo {
   lightingMode: "performance_voxel" | "debug_real_lights" | "experimental_pretty";
   skyLightEnabled: boolean;
@@ -145,6 +172,18 @@ export interface AdditiveLighting {
   ambientFloor: number;
   /** True if any sampled cell had chunk data. */
   hasData: boolean;
+  /** Debug: raw sky light level 0..1 before time multiplier. */
+  rawSkyLevel?: number;
+  /** Debug: applied time multiplier. */
+  skyLightTimeMultiplier?: number;
+  /** Debug: final visual sky after floor + time mult. */
+  visualSky?: number;
+  /** Debug: visual sky floor used. */
+  visualSkyFloor?: number;
+  /** Debug: block light intensity 0..1. */
+  blockIntensity?: number;
+  /** Debug: block tint strength multiplier. */
+  blockTintStrength?: number;
 }
 
 /** Return type for relightAround — debug info for the adapter. */
@@ -190,7 +229,7 @@ export class VoxelLightManager {
   private blockLightBrightness = 1.0;
   private minBrightness = 0.06;
   /** Safe brightness floors — prevent pure black in normal gameplay. */
-  private outdoorMinBrightness = 0.15;
+  private outdoorMinBrightness = 0.65;
   private interiorMinBrightness = 0.08;
   private fullDarkMinBrightness = 0.02;
   /** Time-of-day sky light multiplier (0 = night, 1 = noon). Set by adapter.
@@ -333,7 +372,8 @@ export class VoxelLightManager {
     originX: number,
     originY: number,
     originZ: number,
-    voxelIds: Uint16Array | Int16Array
+    voxelIds: Uint16Array | Int16Array,
+    allowCrossChunkQueue: boolean = true
   ): ChunkLightData {
     const cx = Math.floor(originX / CHUNK_SIZE);
     const cy = Math.floor(originY / CHUNK_SIZE);
@@ -341,10 +381,24 @@ export class VoxelLightManager {
     const data = this.getOrCreateChunkLight(cx, cy, cz);
     const start = performance.now();
 
-    // ---- skyLight: per-column top-down scan ----
+    // ---- skyLight: per-column top-down scan with cross-chunk propagation ----
+    // FIX: Previously every chunk started each column at MAX_LIGHT_LEVEL,
+    // ignoring whether the chunk above had solid blocks. Now we check the
+    // chunk above (cx, cy+1, cz) and use its bottom-row skyLight as the
+    // incoming level. This prevents underground chunks from incorrectly
+    // getting sky=15 when there's solid terrain above them.
+    const chunkAbove = this.getChunkLight(cx, cy + 1, cz);
     for (let lx = 0; lx < CHUNK_SIZE; lx++) {
       for (let lz = 0; lz < CHUNK_SIZE; lz++) {
-        let level = MAX_LIGHT_LEVEL;
+        let level: number;
+        if (chunkAbove) {
+          // Read the bottom row (ly=0) of the chunk above.
+          const aboveIdx = 0 * CHUNK_SIZE * CHUNK_SIZE + lx * CHUNK_SIZE + lz;
+          level = chunkAbove.skyLight[aboveIdx];
+        } else {
+          // No chunk above: this is the topmost chunk. Start at full sky.
+          level = MAX_LIGHT_LEVEL;
+        }
         for (let ly = CHUNK_SIZE - 1; ly >= 0; ly--) {
           const idx = ly * CHUNK_SIZE * CHUNK_SIZE + lx * CHUNK_SIZE + lz;
           const blockId = voxelIds[idx];
@@ -352,8 +406,6 @@ export class VoxelLightManager {
             level = 0; // first opaque block from the top blocks sky light below it
           }
           data.skyLight[idx] = level;
-          // Opaque blocks keep sky 0; non-opaque above surface keep 15.
-          // Below the first opaque, sky stays 0 (cave/underground darkness).
         }
       }
     }
@@ -415,7 +467,7 @@ export class VoxelLightManager {
       }
     }
     // BFS flood-fill each color channel independently (max-level tracking).
-    this.floodFillBlockLight(data, seeds, originX, originY, originZ);
+    this.floodFillBlockLight(data, seeds, originX, originY, originZ, allowCrossChunkQueue);
 
     data.dirty = false;
     data.lightDataVersion++;
@@ -437,7 +489,8 @@ export class VoxelLightManager {
     seeds: Array<{ idx: number; level: number; r: number; g: number; b: number }>,
     originX: number,
     originY: number,
-    originZ: number
+    originZ: number,
+    allowCrossChunkQueue: boolean = true
   ): void {
     // Per-channel BFS. The flat index layout is: idx = y*256 + x*16 + z
     // (matching worldDataNeeded: flatVoxels[j * shape[0] * shape[2] + i * shape[2] + k]
@@ -474,9 +527,9 @@ export class VoxelLightManager {
     // only (stronger light always replaces weaker light). The old `visited`
     // array was a hard blocker that prevented a stronger light from replacing
     // a weaker one already marked visited.
-    this.bfsChannel(data.blockLightR, queueR, originX, originY, originZ);
-    this.bfsChannel(data.blockLightG, queueG, originX, originY, originZ);
-    this.bfsChannel(data.blockLightB, queueB, originX, originY, originZ);
+    this.bfsChannel(data.blockLightR, queueR, originX, originY, originZ, allowCrossChunkQueue);
+    this.bfsChannel(data.blockLightG, queueG, originX, originY, originZ, allowCrossChunkQueue);
+    this.bfsChannel(data.blockLightB, queueB, originX, originY, originZ, allowCrossChunkQueue);
   }
 
   /**
@@ -493,7 +546,8 @@ export class VoxelLightManager {
     queue: Array<{ idx: number; level: number }>,
     originX: number,
     originY: number,
-    originZ: number
+    originZ: number,
+    allowCrossChunkQueue: boolean = true
   ): void {
     let ops = 0;
     const cx = Math.floor(originX / CHUNK_SIZE);
@@ -516,14 +570,18 @@ export class VoxelLightManager {
       for (const [nx, ny, nz] of neighbors) {
         // In-bounds?
         if (nx < 0 || nx >= CHUNK_SIZE || ny < 0 || ny >= CHUNK_SIZE || nz < 0 || nz >= CHUNK_SIZE) {
-          // Cross-chunk: queue neighbor chunk relight. We pass the world-space
-          // edge cell so the neighbor can re-seed from the boundary value.
-          // For v0 simplicity, queue a relight of the neighbor chunk origin.
-          let ncx = cx, ncz = cz, ncy = cy;
-          if (nx < 0) ncx = cx - 1; else if (nx >= CHUNK_SIZE) ncx = cx + 1;
-          if (nz < 0) ncz = cz - 1; else if (nz >= CHUNK_SIZE) ncz = cz + 1;
-          if (ny < 0) ncy = cy - 1; else if (ny >= CHUNK_SIZE) ncy = cy + 1;
-          this.queueChunkRelight(ncx, ncy, ncz, MAX_LIGHT_RADIUS);
+          // Cross-chunk edge. Only queue neighbor relight if allowed.
+          // When allowCrossChunkQueue=false (source-centric sync), we simply
+          // stop — cross-chunk light is handled by recomputing all affected
+          // chunks in the source radius AABB, each of which seeds from the
+          // global voxelLightSources registry.
+          if (allowCrossChunkQueue) {
+            let ncx = cx, ncz = cz, ncy = cy;
+            if (nx < 0) ncx = cx - 1; else if (nx >= CHUNK_SIZE) ncx = cx + 1;
+            if (nz < 0) ncz = cz - 1; else if (nz >= CHUNK_SIZE) ncz = cz + 1;
+            if (ny < 0) ncy = cy - 1; else if (ny >= CHUNK_SIZE) ncy = cy + 1;
+            this.queueChunkRelight(ncx, ncy, ncz, MAX_LIGHT_RADIUS);
+          }
           continue;
         }
         const nIdx = ny * CHUNK_SIZE * CHUNK_SIZE + nx * CHUNK_SIZE + nz;
@@ -595,12 +653,16 @@ export class VoxelLightManager {
     const maxCz = Math.floor((z + MAX_LIGHT_RADIUS) / CHUNK_SIZE);
     const recomputed: string[] = [];
     const affectedChunks: string[] = [];
-    for (let acx = minCx; acx <= maxCx; acx++) {
-      for (let acy = minCy; acy <= maxCy; acy++) {
+    // FIX: process chunks TOP-DOWN by Y (maxCy to minCy) so that skyLight
+    // propagation from the chunk above works correctly. Previously this
+    // iterated bottom-up, which meant lower chunks were computed before
+    // upper chunks — so they couldn't read sky data from above.
+    for (let acy = maxCy; acy >= minCy; acy--) {
+      for (let acx = minCx; acx <= maxCx; acx++) {
         for (let acz = minCz; acz <= maxCz; acz++) {
           const key = this.chunkKey(acx, acy, acz);
           affectedChunks.push(key);
-          this.recomputeChunkLightFromWorld(acx, acy, acz);
+          this.recomputeChunkLightFromWorld(acx, acy, acz, false);
           recomputed.push(key);
         }
       }
@@ -633,11 +695,10 @@ export class VoxelLightManager {
    * registry, so cross-chunk neighbor light sources correctly propagate INTO
    * this chunk during recompute.
    */
-  private recomputeChunkLightFromWorld(cx: number, cy: number, cz: number): void {
+  private recomputeChunkLightFromWorld(cx: number, cy: number, cz: number, allowCrossChunkQueue: boolean = true): void {
     const originX = cx * CHUNK_SIZE;
     const originY = cy * CHUNK_SIZE;
     const originZ = cz * CHUNK_SIZE;
-    // Read voxels from world service.
     const voxelIds = new Uint16Array(CELLS_PER_CHUNK);
     for (let ly = 0; ly < CHUNK_SIZE; ly++) {
       for (let lx = 0; lx < CHUNK_SIZE; lx++) {
@@ -647,11 +708,6 @@ export class VoxelLightManager {
         }
       }
     }
-    // Sync the global voxelLightSources registry: scan this chunk's voxels for
-    // light-emitting blocks and register any that aren't already in the
-    // registry. This ensures static/procedural sources (ruin spires, outpost
-    // lamps, artifacts) are registered when their chunk loads, so neighbor
-    // chunks can propagate their light across boundaries.
     for (let ly = 0; ly < CHUNK_SIZE; ly++) {
       for (let lx = 0; lx < CHUNK_SIZE; lx++) {
         for (let lz = 0; lz < CHUNK_SIZE; lz++) {
@@ -669,7 +725,12 @@ export class VoxelLightManager {
         }
       }
     }
-    this.computeInitialLight(originX, originY, originZ, voxelIds);
+    this.computeInitialLight(originX, originY, originZ, voxelIds, allowCrossChunkQueue);
+  }
+
+  /** Public wrapper for source-centric recompute without cross-chunk queue. */
+  public recomputeChunkNoQueue(cx: number, cy: number, cz: number): void {
+    this.recomputeChunkLightFromWorld(cx, cy, cz, false);
   }
 
   /**
@@ -685,7 +746,8 @@ export class VoxelLightManager {
     originY: number,
     originZ: number,
     voxelIds: Uint16Array
-  ): void {
+  ): Array<{ x: number; y: number; z: number }> {
+    const newSources: Array<{ x: number; y: number; z: number }> = [];
     for (let ly = 0; ly < CHUNK_SIZE; ly++) {
       for (let lx = 0; lx < CHUNK_SIZE; lx++) {
         for (let lz = 0; lz < CHUNK_SIZE; lz++) {
@@ -698,11 +760,13 @@ export class VoxelLightManager {
             const key = `${wx},${wy},${wz}`;
             if (!this.voxelLightSources.has(key)) {
               this.voxelLightSources.set(key, { x: wx, y: wy, z: wz, level: emit.level, r: emit.r, g: emit.g, b: emit.b });
+              newSources.push({ x: wx, y: wy, z: wz });
             }
           }
         }
       }
     }
+    return newSources;
   }
 
   /**
@@ -724,7 +788,7 @@ export class VoxelLightManager {
       const item = this.relightQueue.shift()!;
       const key = this.chunkKey(item.x, item.y, item.z);
       this.relightQueueSet.delete(key);
-      this.recomputeChunkLightFromWorld(item.x, item.y, item.z);
+      this.recomputeChunkLightFromWorld(item.x, item.y, item.z, false);
       processedChunks.push(key);
       processed++;
     }
@@ -814,21 +878,34 @@ export class VoxelLightManager {
       };
     }
 
-    // ---- SKY part: NOT baked into vertex colors ----
-    // Sky light is handled by Babylon's HemisphericLight + DirectionalLight
-    // (SkyController). We set skyR/G/B = 1.0 so the vertex color passes through
-    // the diffuse multiplication at full strength, and Babylon's lights
-    // determine the actual brightness. This PREVENTS double-lighting: previously
-    // we baked skyLight × timeMultiplier into the vertex color AND Babylon lights
-    // multiplied it again, making everything either too dark (disableLighting=true)
-    // or too bright (high light intensity).
-    // The skyLight data is still used for the ambient floor (interior vs outdoor).
-    const skyR = 1.0;
-    const skyG = 1.0;
-    const skyB = 1.0;
+    // ---- CLASSIC VOXEL LIGHTING FORMULA ----
+    // SkyLight: actual per-cell sky light (0-15) × time-of-day multiplier.
+    //   This gives correct day/night: day = full sky, night = dark sky.
+    //   Newly loaded surface chunks get skyLight=15 (open sky), so they're
+    //   bright at day. Underground chunks get skyLight=0, so they're dark
+    //   unless block lights illuminate them.
+    // BlockLight: RGB per-cell, additive on top of sky. Colored tint.
+    //
+    // Formula: finalRGB = baseRGB * skyPart + blockTint
+    //   skyPart = (skyLight / 15) * timeMult
+    //   blockTint = normalizedBlockRGB * (maxBlockChan / 15) * blockTintStrength
+    //
+    // A minimum ambient floor prevents completely black terrain so the game
+    // is always playable, but it's LOW (0.08) so night/underground is dark.
 
-    // ---- BLOCK part (colored, NO time multiplier) ----
-    // blockIntensity = max channel / 15. blockColor = normalized RGB.
+    const timeMult = this.skyLightEnabled ? this.skyLightTimeMultiplier : 1.0;
+    const rawSkyLevel = maxSky / MAX_LIGHT_LEVEL; // 0..1
+    const skyPart = rawSkyLevel * timeMult;
+
+    // Ambient floor: a small minimum so terrain is never pure black.
+    // Outdoor (sky>0) gets a slightly higher floor; underground gets lower.
+    const ambientFloor = maxSky > 0 ? this.outdoorMinBrightness : this.interiorMinBrightness;
+
+    const skyR = Math.max(ambientFloor, skyPart);
+    const skyG = Math.max(ambientFloor, skyPart);
+    const skyB = Math.max(ambientFloor, skyPart);
+
+    // ---- BLOCK part (colored lamp light, ADDITIVE on top of sky) ----
     const maxChan = Math.max(maxR, maxG, maxB);
     let blockPartR = 0, blockPartG = 0, blockPartB = 0;
     if (maxChan > 0 && this.blockLightEnabled) {
@@ -836,20 +913,25 @@ export class VoxelLightManager {
       const bcG = maxG / maxChan;
       const bcB = maxB / maxChan;
       const blockIntensity = maxChan / MAX_LIGHT_LEVEL;
-      const strength = blockIntensity * this.blockLightBrightness;
+      const blockTintStrength = this.blockLightBrightness;
+      const strength = blockIntensity * blockTintStrength;
       blockPartR = bcR * strength;
       blockPartG = bcG * strength;
       blockPartB = bcB * strength;
     }
-
-    // ---- Ambient floor (outdoor for sky-exposed, interior for covered) ----
-    const ambientFloor = maxSky > 0 ? this.outdoorMinBrightness : this.interiorMinBrightness;
 
     return {
       skyR, skyG, skyB,
       blockR: blockPartR, blockG: blockPartG, blockB: blockPartB,
       ambientFloor,
       hasData: true,
+      // Debug values exposed for F3 panel
+      rawSkyLevel: maxSky / MAX_LIGHT_LEVEL,
+      skyLightTimeMultiplier: timeMult,
+      visualSky: skyPart,
+      visualSkyFloor: ambientFloor,
+      blockIntensity: maxChan > 0 ? maxChan / MAX_LIGHT_LEVEL : 0,
+      blockTintStrength: this.blockLightBrightness,
     };
   }
 
@@ -960,25 +1042,14 @@ export class VoxelLightManager {
       const newColors = new Float32Array(baseColors.length);
       let missingDataFallback = false;
       let invalidColorWrite = false;
+      let unchangedNoLightVertices = 0;
+      let blockLitVertices = 0;
+      let maxBlockTint = 0;
 
       for (let v = 0; v < numVerts; v++) {
         const wx = positions[v * 3] + chunkOriginX;
         const wy = positions[v * 3 + 1] + chunkOriginY;
         const wz = positions[v * 3 + 2] + chunkOriginZ;
-        let add: AdditiveLighting;
-        try {
-          add = this.computeAdditiveLighting(wx, wy, wz);
-        } catch {
-          const fb = this.outdoorMinBrightness;
-          add = {
-            skyR: fb, skyG: fb, skyB: fb,
-            blockR: 0, blockG: 0, blockB: 0,
-            ambientFloor: this.outdoorMinBrightness,
-            hasData: false,
-          };
-          missingDataFallback = true;
-        }
-        if (!add.hasData) missingDataFallback = true;
 
         const baseR = baseColors[v * 4];
         const baseG = baseColors[v * 4 + 1];
@@ -994,36 +1065,67 @@ export class VoxelLightManager {
           continue;
         }
 
-        // ADDITIVE/TINT: base * skyPart + blockPart, with FLAT ambient floor.
-        // The floor is NOT multiplied by baseColor — it's a flat minimum
-        // brightness so even dark-colored blocks (ancient stone, metal) are
-        // readable. Previously floor = base * 0.45 → dark blocks stayed dark.
-        const litR = baseR * add.skyR + add.blockR;
-        const litG = baseG * add.skyG + add.blockG;
-        const litB = baseB * add.skyB + add.blockB;
-        const floorR = add.ambientFloor;
-        const floorG = add.ambientFloor;
-        const floorB = add.ambientFloor;
+        // ---- BLOCK-LIGHT-ONLY ADDITIVE TINT ----
+        // The global lighting (sun/moon/ambient from SkyController + Babylon
+        // scene lights) already works correctly via noa's material system.
+        // VoxelLightManager must ONLY add local block-light tint on top of
+        // the original base color. It must NOT darken, brighten, or otherwise
+        // modify vertices that have no nearby block light.
+        //
+        // Formula: finalColor = clamp01(baseColor + blockTint)
+        //   blockTint = normalizedBlockRGB * blockIntensity * blockTintStrength
+        //
+        // If blockLight = 0: finalColor = baseColor (unchanged).
+        // If blockLight > 0: finalColor = baseColor + colored tint.
 
-        let fr = clamp01(Math.max(floorR, litR));
-        let fg = clamp01(Math.max(floorG, litG));
-        let fb = clamp01(Math.max(floorB, litB));
+        let blockTintR = 0, blockTintG = 0, blockTintB = 0;
+        try {
+          const add = this.computeAdditiveLighting(wx, wy, wz);
+          if (!add.hasData) missingDataFallback = true;
+          blockTintR = add.blockR;
+          blockTintG = add.blockG;
+          blockTintB = add.blockB;
+        } catch {
+          missingDataFallback = true;
+        }
+
+        // If no block light, write base color unchanged.
+        if (blockTintR === 0 && blockTintG === 0 && blockTintB === 0) {
+          newColors[v * 4] = baseR;
+          newColors[v * 4 + 1] = baseG;
+          newColors[v * 4 + 2] = baseB;
+          newColors[v * 4 + 3] = baseColors[v * 4 + 3] ?? 1;
+          unchangedNoLightVertices++;
+          continue;
+        }
+
+        // Additive block light tint on top of base color.
+        let fr = clamp01(baseR + blockTintR);
+        let fg = clamp01(baseG + blockTintG);
+        let fb = clamp01(baseB + blockTintB);
 
         // Final NaN check on output.
-        if (isNaN(fr)) fr = 0.5;
-        if (isNaN(fg)) fg = 0.5;
-        if (isNaN(fb)) fb = 0.5;
+        if (isNaN(fr)) fr = baseR;
+        if (isNaN(fg)) fg = baseG;
+        if (isNaN(fb)) fb = baseB;
 
         newColors[v * 4] = fr;
         newColors[v * 4 + 1] = fg;
         newColors[v * 4 + 2] = fb;
         newColors[v * 4 + 3] = baseColors[v * 4 + 3] ?? 1; // alpha
+        blockLitVertices++;
+        if (blockTintR > maxBlockTint) maxBlockTint = blockTintR;
+        if (blockTintG > maxBlockTint) maxBlockTint = blockTintG;
+        if (blockTintB > maxBlockTint) maxBlockTint = blockTintB;
       }
 
       mesh.setVerticesData(BABYLON.VertexBuffer.ColorKind, newColors, false, 4);
       mesh.metadata.fpLastRecolorTime = performance.now();
       mesh.metadata.fpCacheRefreshed = cacheRefreshed;
       mesh.metadata.fpCacheInvalidationReason = cacheInvalidationReason;
+      mesh.metadata.fpUnchangedNoLightVertices = unchangedNoLightVertices;
+      mesh.metadata.fpBlockLitVertices = blockLitVertices;
+      mesh.metadata.fpMaxBlockTint = maxBlockTint;
       const cx = Math.floor(chunkOriginX / CHUNK_SIZE);
       const cy = Math.floor(chunkOriginY / CHUNK_SIZE);
       const cz = Math.floor(chunkOriginZ / CHUNK_SIZE);
@@ -1056,15 +1158,19 @@ export class VoxelLightManager {
     for (const mesh of scene.meshes) {
       if (!mesh.name || !mesh.name.startsWith || !mesh.name.startsWith("chunk_")) continue;
       if (!mesh.isEnabled()) continue;
-      // Determine chunk origin from mesh.position (noa sets this to the chunk's
-      // world-space origin; vertex positions are local 0..16).
-      const ox = mesh.position ? Math.floor(mesh.position.x) : 0;
-      const oy = mesh.position ? Math.floor(mesh.position.y) : 0;
-      const oz = mesh.position ? Math.floor(mesh.position.z) : 0;
-      const cx = Math.floor(ox / CHUNK_SIZE);
-      const cy = Math.floor(oy / CHUNK_SIZE);
-      const cz = Math.floor(oz / CHUNK_SIZE);
-      if (!wanted.has(`${cx},${cy},${cz}`)) continue;
+      // FIX: use Math.round instead of Math.floor for negative coordinate safety.
+      // noa sets mesh.position to the chunk's world-space origin (e.g. -16, -16),
+      // but floating-point drift can make it -15.9999999. Math.floor(-15.9999) = -16
+      // (correct), but Math.floor(-16.0000001) = -17 (wrong). Math.round handles
+      // both cases correctly since chunk origins are always exact multiples of 16.
+      const ox = mesh.position ? Math.round(mesh.position.x) : 0;
+      const oy = mesh.position ? Math.round(mesh.position.y) : 0;
+      const oz = mesh.position ? Math.round(mesh.position.z) : 0;
+      const cx = Math.round(ox / CHUNK_SIZE);
+      const cy = Math.round(oy / CHUNK_SIZE);
+      const cz = Math.round(oz / CHUNK_SIZE);
+      const key = `${cx},${cy},${cz}`;
+      if (!wanted.has(key)) continue;
       this.recolorMesh(mesh, ox, oy, oz);
       count++;
     }
@@ -1084,9 +1190,9 @@ export class VoxelLightManager {
     for (const mesh of scene.meshes) {
       if (!mesh.name || !mesh.name.startsWith || !mesh.name.startsWith("chunk_")) continue;
       if (!mesh.isEnabled()) continue;
-      const ox = mesh.position ? Math.floor(mesh.position.x) : 0;
-      const oy = mesh.position ? Math.floor(mesh.position.y) : 0;
-      const oz = mesh.position ? Math.floor(mesh.position.z) : 0;
+      const ox = mesh.position ? Math.round(mesh.position.x) : 0;
+      const oy = mesh.position ? Math.round(mesh.position.y) : 0;
+      const oz = mesh.position ? Math.round(mesh.position.z) : 0;
       this.recolorMesh(mesh, ox, oy, oz);
       count++;
     }
@@ -1110,9 +1216,9 @@ export class VoxelLightManager {
     for (const mesh of scene.meshes) {
       if (!mesh.name || !mesh.name.startsWith || !mesh.name.startsWith("chunk_")) continue;
       if (!mesh.isEnabled()) continue;
-      const mx = mesh.position ? Math.floor(mesh.position.x / CHUNK_SIZE) : 0;
-      const my = mesh.position ? Math.floor(mesh.position.y / CHUNK_SIZE) : 0;
-      const mz = mesh.position ? Math.floor(mesh.position.z / CHUNK_SIZE) : 0;
+      const mx = mesh.position ? Math.round(mesh.position.x / CHUNK_SIZE) : 0;
+      const my = mesh.position ? Math.round(mesh.position.y / CHUNK_SIZE) : 0;
+      const mz = mesh.position ? Math.round(mesh.position.z / CHUNK_SIZE) : 0;
       // Invalidate meshes in the home chunk + ±1 neighbors.
       if (Math.abs(mx - cx) <= 1 && Math.abs(my - cy) <= 1 && Math.abs(mz - cz) <= 1) {
         if (mesh.metadata && mesh.metadata.fpBaseVertexColors) {
@@ -1138,9 +1244,9 @@ export class VoxelLightManager {
     for (const mesh of scene.meshes) {
       if (!mesh.name || !mesh.name.startsWith || !mesh.name.startsWith("chunk_")) continue;
       if (!mesh.isEnabled()) continue;
-      const ox = mesh.position ? Math.floor(mesh.position.x) : 0;
-      const oy = mesh.position ? Math.floor(mesh.position.y) : 0;
-      const oz = mesh.position ? Math.floor(mesh.position.z) : 0;
+      const ox = mesh.position ? Math.round(mesh.position.x) : 0;
+      const oy = mesh.position ? Math.round(mesh.position.y) : 0;
+      const oz = mesh.position ? Math.round(mesh.position.z) : 0;
       const cx = Math.floor(ox / CHUNK_SIZE);
       const cy = Math.floor(oy / CHUNK_SIZE);
       const cz = Math.floor(oz / CHUNK_SIZE);
@@ -1208,7 +1314,7 @@ export class VoxelLightManager {
     result.vertexCount = posData ? posData.length / 3 : 0;
     result.hasVertexColors = !!mesh.getVerticesData(BABYLON.VertexBuffer.ColorKind);
     result.hasCachedBaseColors = !!(mesh.metadata && mesh.metadata.fpBaseVertexColors);
-    const ox = Math.floor(mesh.position.x), oy = Math.floor(mesh.position.y), oz = Math.floor(mesh.position.z);
+    const ox = Math.round(mesh.position.x), oy = Math.round(mesh.position.y), oz = Math.round(mesh.position.z);
     // Run ONE recolor first to establish a baseline at current lighting conditions.
     // The "before" must be from a fresh recolor, not from stale prior-recolor colors
     // (which may have been set at a different time-of-day).
@@ -1389,7 +1495,7 @@ export class VoxelLightManager {
     let recomputed = 0;
     for (const key of this.chunkLight.keys()) {
       const [cx, cy, cz] = key.split(",").map(Number);
-      this.recomputeChunkLightFromWorld(cx, cy, cz);
+      this.recomputeChunkLightFromWorld(cx, cy, cz, false);
       recomputed++;
     }
     const recoloredMeshCount = scene ? this.recolorAllVisibleChunkMeshes(scene) : 0;
@@ -1477,6 +1583,161 @@ export class VoxelLightManager {
       neighbors,
       nearestSource: nearestSource ? { pos: [nearestSource.x, nearestSource.y, nearestSource.z], level: nearestSource.level, color: [nearestSource.r, nearestSource.g, nearestSource.b], distance: nearestDist } : null,
       brightnessAtSurface: brightness,
+    };
+  }
+
+  /**
+   * 3×3 Surface Light Test — the CORE acceptance test for voxel lighting.
+   *
+   * Evaluates the 9 cells (3×3 grid) around a light position, measuring their
+   * brightness BEFORE placement, AFTER placement, and AFTER removal. A test
+   * PASSES only if the SURROUNDING cells (not the source itself) become
+   * measurably brighter after placement AND dimmer after removal.
+   *
+   * This is deliberately stricter than checking blockLightAtSource > 0 or
+   * recoloredMeshCount > 0 — those can pass while the visible surface remains
+   * dark. This test validates actual surface illumination.
+   *
+   * @param centerX  light source world X
+   * @param centerY  light source world Y
+   * @param centerZ  light source world Z
+   * @param placeFn  callback to place the light block + register source
+   * @param removeFn callback to remove the light block + unregister source
+   * @returns SurfaceTestResult with per-cell deltas + PASS/FAIL/INCONCLUSIVE
+   */
+  public runSurface3x3Test(
+    centerX: number,
+    centerY: number,
+    centerZ: number,
+    placeFn: () => void,
+    removeFn: () => void
+  ): SurfaceTestResult {
+    // The 9 cells: 3×3 grid on the Y plane just below the light (the floor
+    // surface the light illuminates). We sample the cells at centerY-1 (the
+    // floor) so we're measuring the surface the light hits, not the source
+    // cell itself.
+    const surfaceY = centerY - 1;
+    const cells: Array<{ x: number; y: number; z: number }> = [];
+    for (let dx = -1; dx <= 1; dx++) {
+      for (let dz = -1; dz <= 1; dz++) {
+        cells.push({ x: centerX + dx, y: surfaceY, z: centerZ + dz });
+      }
+    }
+
+    // Also sample the 4 vertical neighbors (walls around the light at same Y).
+    const wallOffsets = [[1,0,0],[-1,0,0],[0,0,1],[0,0,-1]];
+    for (const [dx, dy, dz] of wallOffsets) {
+      cells.push({ x: centerX + dx, y: centerY, z: centerZ + dz });
+    }
+
+    const recordAll = (): Array<{
+      worldPos: [number, number, number];
+      blockId: number;
+      chunkKey: string;
+      localCell: [number, number, number];
+      hasLightData: boolean;
+      brightness: [number, number, number];
+    }> => {
+      return cells.map(c => {
+        const cx = Math.floor(c.x / CHUNK_SIZE);
+        const cy = Math.floor(c.y / CHUNK_SIZE);
+        const cz = Math.floor(c.z / CHUNK_SIZE);
+        const lx = Math.floor(c.x) - cx * CHUNK_SIZE;
+        const ly = Math.floor(c.y) - cy * CHUNK_SIZE;
+        const lz = Math.floor(c.z) - cz * CHUNK_SIZE;
+        const data = this.getChunkLight(cx, cy, cz);
+        const blockId = this.getBlockAt(c.x, c.y, c.z);
+        const br = this.brightnessAtSurface(c.x, c.y, c.z);
+        return {
+          worldPos: [c.x, c.y, c.z] as [number, number, number],
+          blockId,
+          chunkKey: this.chunkKey(cx, cy, cz),
+          localCell: [lx, ly, lz] as [number, number, number],
+          hasLightData: !!data,
+          brightness: [br[0], br[1], br[2]] as [number, number, number],
+        };
+      });
+    };
+
+    const before = recordAll();
+
+    // Place the light
+    placeFn();
+
+    const after = recordAll();
+
+    // Remove the light
+    removeFn();
+
+    const afterRemove = recordAll();
+
+    // Compute deltas per cell
+    const cellResults: SurfaceTestCellResult[] = before.map((b, i) => {
+      const a = after[i];
+      const ar = afterRemove[i];
+      const dp: [number, number, number] = [
+        a.brightness[0] - b.brightness[0],
+        a.brightness[1] - b.brightness[1],
+        a.brightness[2] - b.brightness[2],
+      ];
+      const dr: [number, number, number] = [
+        ar.brightness[0] - a.brightness[0],
+        ar.brightness[1] - a.brightness[1],
+        ar.brightness[2] - a.brightness[2],
+      ];
+      const brightenedPlace = dp[0] > 0.01 || dp[1] > 0.01 || dp[2] > 0.01;
+      const dimmedRemove = dr[0] < -0.01 || dr[1] < -0.01 || dr[2] < -0.01;
+      return {
+        worldPos: b.worldPos,
+        blockId: b.blockId,
+        chunkKey: b.chunkKey,
+        localCell: b.localCell,
+        hasLightData: b.hasLightData,
+        brightnessBefore: b.brightness,
+        brightnessAfter: a.brightness,
+        brightnessAfterRemove: ar.brightness,
+        deltaPlace: dp,
+        deltaRemove: dr,
+        brightenedOnPlace: brightenedPlace,
+        dimmedOnRemove: dimmedRemove,
+      };
+    });
+
+    // PASS criteria: at least 3 surrounding cells brightened on place AND
+    // dimmed on remove. (3 out of 13 cells = the light must actually reach
+    // the surface, not just the source.)
+    const cellsBrightened = cellResults.filter(c => c.brightenedOnPlace).length;
+    const cellsDimmed = cellResults.filter(c => c.dimmedOnRemove).length;
+    const cellsWithLightData = cellResults.filter(c => c.hasLightData).length;
+
+    let result: "PASS" | "FAIL" | "INCONCLUSIVE";
+    let reason: string;
+
+    if (cellsWithLightData < 3) {
+      result = "INCONCLUSIVE";
+      reason = `Only ${cellsWithLightData}/13 cells have light data (chunks not loaded)`;
+    } else if (cellsBrightened >= 3 && cellsDimmed >= 3) {
+      result = "PASS";
+      reason = `${cellsBrightened} cells brightened on place, ${cellsDimmed} dimmed on remove`;
+    } else if (cellsBrightened === 0) {
+      result = "FAIL";
+      reason = `No surrounding cells brightened (source may be bright but surface is dark). cellsWithLightData=${cellsWithLightData}`;
+    } else if (cellsDimmed === 0) {
+      result = "FAIL";
+      reason = `No surrounding cells dimmed on removal (stale lighting). cellsBrightened=${cellsBrightened}`;
+    } else {
+      result = "FAIL";
+      reason = `Insufficient surface response: ${cellsBrightened} brightened, ${cellsDimmed} dimmed (need ≥3 each)`;
+    }
+
+    return {
+      centerPos: [centerX, centerY, centerZ],
+      cells: cellResults,
+      cellsBrightened,
+      cellsDimmed,
+      cellsWithLightData,
+      result,
+      reason,
     };
   }
 

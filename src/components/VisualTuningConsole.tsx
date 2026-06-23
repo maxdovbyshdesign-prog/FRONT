@@ -267,6 +267,40 @@ export default function VisualTuningConsole() {
   const [tuning, setTuning] = useState<VisualTuningState>(DEFAULT_TUNING);
   const [liveStats, setLiveStats] = useState<any>(null);
   const [presetName, setPresetName] = useState('Atmospheric Default');
+  const [lastTestResult, setLastTestResult] = useState<any>(null);
+  const [testRunning, setTestRunning] = useState<string | null>(null);
+  const [chunkGridVisible, setChunkGridVisible] = useState(false);
+  const [showFpsCounter, setShowFpsCounter] = useState(false);
+  const [fpsData, setFpsData] = useState({ fps: 0, avgFps: 0, meshCount: 0, chunkCount: 0 });
+
+  // FPS counter: lightweight rAF-based measurement
+  useEffect(() => {
+    if (!showFpsCounter) return;
+    let frameCount = 0;
+    let lastTime = performance.now();
+    let fpsHistory: number[] = [];
+    let rafId: number;
+    const tick = () => {
+      frameCount++;
+      const now = performance.now();
+      const elapsed = now - lastTime;
+      if (elapsed >= 500) {
+        const fps = Math.round((frameCount * 1000) / elapsed);
+        fpsHistory.push(fps);
+        if (fpsHistory.length > 4) fpsHistory.shift();
+        const avgFps = Math.round(fpsHistory.reduce((a, b) => a + b, 0) / fpsHistory.length);
+        const dbg = getDbg();
+        const meshCount = dbg ? dbg()?.terrain?.meshCount ?? 0 : 0;
+        const chunkCount = dbg ? dbg()?.chunkGridDebug?.chunksWithLightData ?? 0 : 0;
+        setFpsData({ fps, avgFps, meshCount, chunkCount });
+        frameCount = 0;
+        lastTime = now;
+      }
+      rafId = requestAnimationFrame(tick);
+    };
+    rafId = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(rafId);
+  }, [showFpsCounter]);
 
   // Poll live tuning + stats at 4Hz
   useEffect(() => {
@@ -317,7 +351,11 @@ export default function VisualTuningConsole() {
       <div className="bg-black/40 rounded p-1.5 text-[8px] text-white/60 font-mono">
         <div>TOD: {liveStats?.timeOfDay?.toFixed(3)} | RDB: {rdb}b | Q: {liveStats?.quality}</div>
         <div>Chunks: {liveStats?.terrain?.meshCount ?? '?'} | Lights: {liveStats?.worldLightManager?.active ?? '?'}/{liveStats?.worldLightManager?.registered ?? '?'}</div>
+        {showFpsCounter && (
+          <div className="text-green-400 font-bold">FPS: {fpsData.fps} (avg {fpsData.avgFps}) | Meshes: {fpsData.meshCount} | Chunks: {fpsData.chunkCount}</div>
+        )}
       </div>
+      <Checkbox label="Show FPS Counter" checked={showFpsCounter} onChange={setShowFpsCounter} />
 
       {/* G. Presets */}
       <Section title="Presets">
@@ -632,6 +670,230 @@ export default function VisualTuningConsole() {
       </Section>
 
       {/* Export/Import */}
+      {/* Voxel Lighting Tests */}
+      <Section title="Voxel Lighting Tests">
+        {/* Chunk Grid toggle */}
+        <Checkbox
+          label="Show Chunk Grid"
+          checked={chunkGridVisible}
+          onChange={(v) => {
+            setChunkGridVisible(v);
+            const dbg = getDbg();
+            if (dbg) { const s = dbg(); if (s) s.showChunkGrid(v); }
+          }}
+        />
+        {/* Chunk grid readout */}
+        <div className="bg-black/40 rounded p-1.5 text-[8px] text-white/50 font-mono">
+          {(() => {
+            const cg = liveStats?.chunkGridDebug;
+            if (!cg) return <div>chunk grid info unavailable</div>;
+            return (
+              <>
+                <div>pos: [{cg.playerWorldPos?.join(', ')}]</div>
+                <div>chunk: {cg.playerChunkKey} | cell: [{cg.playerLocalCell?.join(', ')}]</div>
+                <div>border X: {cg.distToBorderX} | Z: {cg.distToBorderZ} | near: {String(cg.isNearBorder)}</div>
+                <div>affected: {cg.lastAffectedChunks?.length ?? 0} | queue: {cg.relightQueueKeys?.length ?? 0}</div>
+              </>
+            );
+          })()}
+        </div>
+
+        {/* Test buttons */}
+        <div className="flex flex-wrap gap-1 mt-1">
+          <Button label="3×3 Surface" onClick={async () => {
+            setTestRunning('3x3');
+            try {
+              const dbg = getDbg();
+              if (dbg) { const s = dbg(); if (s) { const r = await s.surface3x3Test(); setLastTestResult(r); console.log('[3x3 Test]', r); } }
+            } finally { setTestRunning(null); }
+          }} variant="primary" />
+          <Button label="Sweep +X" onClick={async () => {
+            setTestRunning('sweep+X');
+            try { const dbg = getDbg(); if (dbg) { const s = dbg(); if (s) { const r = await s.lightSweepTest('+X'); setLastTestResult(r); console.log('[Sweep +X]', r); } } } finally { setTestRunning(null); }
+          }} />
+          <Button label="Sweep -X" onClick={async () => {
+            setTestRunning('sweep-X');
+            try { const dbg = getDbg(); if (dbg) { const s = dbg(); if (s) { const r = await s.lightSweepTest('-X'); setLastTestResult(r); console.log('[Sweep -X]', r); } } } finally { setTestRunning(null); }
+          }} />
+          <Button label="Sweep +Z" onClick={async () => {
+            setTestRunning('sweep+Z');
+            try { const dbg = getDbg(); if (dbg) { const s = dbg(); if (s) { const r = await s.lightSweepTest('+Z'); setLastTestResult(r); console.log('[Sweep +Z]', r); } } } finally { setTestRunning(null); }
+          }} />
+          <Button label="Sweep -Z" onClick={async () => {
+            setTestRunning('sweep-Z');
+            try { const dbg = getDbg(); if (dbg) { const s = dbg(); if (s) { const r = await s.lightSweepTest('-Z'); setLastTestResult(r); console.log('[Sweep -Z]', r); } } } finally { setTestRunning(null); }
+          }} />
+          <Button label="Sweep Diag" onClick={async () => {
+            setTestRunning('sweepDiag');
+            try { const dbg = getDbg(); if (dbg) { const s = dbg(); if (s) { const r = await s.lightSweepTest('diag'); setLastTestResult(r); console.log('[Sweep Diag]', r); } } } finally { setTestRunning(null); }
+          }} />
+        </div>
+        <div className="flex flex-wrap gap-1">
+          <Button label="Chunk Border" onClick={async () => {
+            setTestRunning('border');
+            try { const dbg = getDbg(); if (dbg) { const s = dbg(); if (s) { const r = await s.chunkBorderLightTest(); setLastTestResult(r); console.log('[Chunk Border]', r); } } } finally { setTestRunning(null); }
+          }} />
+          <Button label="Far From Spawn" onClick={async () => {
+            setTestRunning('far');
+            try { const dbg = getDbg(); if (dbg) { const s = dbg(); if (s) { const r = await s.farFromSpawnTest(); setLastTestResult(r); console.log('[Far From Spawn]', r); } } } finally { setTestRunning(null); }
+          }} />
+          <Button label="Place/Remove Stress" onClick={async () => {
+            setTestRunning('stress');
+            try { const dbg = getDbg(); if (dbg) { const s = dbg(); if (s) { const r = await s.placeRemoveStressTest(); setLastTestResult(r); console.log('[Stress]', r); } } } finally { setTestRunning(null); }
+          }} />
+          <Button label="Ruin Stress" onClick={async () => {
+            setTestRunning('ruin');
+            try { const dbg = getDbg(); if (dbg) { const s = dbg(); if (s) { const r = await s.ruinStressTest(); setLastTestResult(r); console.log('[Ruin Stress]', r); } } } finally { setTestRunning(null); }
+          }} />
+          <Button label="Inspect Crosshair" onClick={() => {
+            const dbg = getDbg();
+            if (dbg) { const s = dbg(); if (s) { const r = s.inspectCrosshairLighting(); setLastTestResult(r); console.log('[Inspect]', r); } }
+          }} />
+          <Button label="Inspect Target Light" onClick={() => {
+            const dbg = getDbg();
+            if (dbg) { const s = dbg(); if (s) { const r = s.inspectTargetLight(); setLastTestResult(r); console.log('[Target Light]', r); } }
+          }} variant="primary" />
+          <Button label="3×3 Around Target" onClick={async () => {
+            setTestRunning('3x3target');
+            try { const dbg = getDbg(); if (dbg) { const s = dbg(); if (s) { const r = await s.run3x3AroundTargetTest(); setLastTestResult(r); console.log('[3x3 Target]', r); } } } finally { setTestRunning(null); }
+          }} variant="primary" />
+          <Button label="User Light Repro" onClick={async () => {
+            setTestRunning('repro');
+            try { const dbg = getDbg(); if (dbg) { const s = dbg(); if (s) { const r = await s.runUserLightRepro(); setLastTestResult(r); console.log('[User Repro]', r); } } } finally { setTestRunning(null); }
+          }} variant="primary" />
+        </div>
+        <div className="flex flex-wrap gap-1 mt-1">
+          <Button label="Start Walk Monitor" onClick={() => {
+            const dbg = getDbg(); if (dbg) { const s = dbg(); if (s) { s.startWalkingMonitor(); setLastTestResult({info: "Walking monitor started. Walk across a chunk boundary."}); } }
+          }} variant="primary" />
+          <Button label="Stop Walk Monitor" onClick={() => {
+            const dbg = getDbg(); if (dbg) { const s = dbg(); if (s) { s.stopWalkingMonitor(); } }
+          }} />
+        </div>
+        {/* Walking monitor live state */}
+        {liveStats?.walkingMonitor?.active && (
+          <div className="bg-black/40 rounded p-1.5 text-[8px] text-white/50 font-mono mt-1">
+            <div className="text-[#00f2ff] font-bold">WALKING MONITOR</div>
+            <div>start: {liveStats.walkingMonitor.startChunk}</div>
+            <div>current: {liveStats.walkingMonitor.currentChunk}</div>
+            <div>prev: {liveStats.walkingMonitor.previousChunk}</div>
+            {liveStats.walkingMonitor.lastResult && (
+              <>
+                <div className={liveStats.walkingMonitor.lastResult.result === 'PASS' ? 'text-green-400 font-bold' : 'text-red-400 font-bold'}>
+                  {liveStats.walkingMonitor.lastResult.result}: {liveStats.walkingMonitor.lastResult.rootCause || 'ok'}
+                </div>
+                <div>old→new: {liveStats.walkingMonitor.lastResult.oldChunk}→{liveStats.walkingMonitor.lastResult.newChunk}</div>
+                <div>cellsLit: {liveStats.walkingMonitor.lastResult.cellsLit} | recolored: {liveStats.walkingMonitor.lastResult.recoloredMeshes}</div>
+                <div>staleAfter: {liveStats.walkingMonitor.lastResult.staleMeshesAfter} | tinted: {liveStats.walkingMonitor.lastResult.tintedVerts}</div>
+                <div>queue: {liveStats.walkingMonitor.lastResult.queueBefore}→{liveStats.walkingMonitor.lastResult.queueAfter} | affectedQueued: {liveStats.walkingMonitor.lastResult.affectedQueuedChunksAfter}</div>
+                <div>FPS: {liveStats.walkingMonitor.lastResult.fpsCurrent} (avg {liveStats.walkingMonitor.lastResult.fpsAverage})</div>
+              </>
+            )}
+          </div>
+        )}
+
+        {/* Test running indicator */}
+        {testRunning && (
+          <div className="text-[#00f2ff] text-[9px] animate-pulse">
+            ⏳ Running: {testRunning}...
+          </div>
+        )}
+
+        {/* Last test result */}
+        {lastTestResult && (
+          <div className="bg-black/40 rounded p-1.5 text-[8px] text-white/60 font-mono mt-1 max-h-48 overflow-y-auto">
+            <div className="text-[#00f2ff] font-bold mb-0.5">LAST TEST RESULT</div>
+            {(() => {
+              if (lastTestResult.error) {
+                return <div className="text-red-400 font-bold">ERROR: {lastTestResult.error}</div>;
+              }
+              // User repro format: { near: {...}, far: {...}, overallResult, overallReason }
+              if (lastTestResult.near && lastTestResult.far) {
+                const overallColor = lastTestResult.overallResult === 'PASS' ? 'text-green-400' : 'text-red-400';
+                return (
+                  <div>
+                    <div className={overallColor + ' font-bold'}>{lastTestResult.overallResult}</div>
+                    <div className="text-white/50">{lastTestResult.overallReason}</div>
+                    <div className="mt-1 border-t border-white/10 pt-1">
+                      <div className="text-[#00f2ff] font-bold">NEAR:</div>
+                      <div className={lastTestResult.near.result === 'PASS' ? 'text-green-400' : 'text-red-400'}>
+                        {lastTestResult.near.result} — {lastTestResult.near.rootCause || 'ok'}
+                      </div>
+                      <div>lit: {lastTestResult.near.cellsLitByRawBlockLight} | cleared: {lastTestResult.near.cellsClearedAfterRemoval}</div>
+                      <div>recolored: {lastTestResult.near.recoloredMeshes} | srcReg: {String(lastTestResult.near.sourceRegisteredAfterRegister)}</div>
+                    </div>
+                    <div className="mt-1 border-t border-white/10 pt-1">
+                      <div className="text-[#00f2ff] font-bold">FAR:</div>
+                      <div className={lastTestResult.far.result === 'PASS' ? 'text-green-400' : 'text-red-400'}>
+                        {lastTestResult.far.result} — {lastTestResult.far.rootCause || 'ok'}
+                      </div>
+                      <div>lit: {lastTestResult.far.cellsLitByRawBlockLight} | cleared: {lastTestResult.far.cellsClearedAfterRemoval}</div>
+                      <div>recolored: {lastTestResult.far.recoloredMeshes} | srcReg: {String(lastTestResult.far.sourceRegisteredAfterRegister)}</div>
+                      <div>chunk: {lastTestResult.far.chunkKey} | meshes: {lastTestResult.far.visibleMeshesNearby}</div>
+                    </div>
+                  </div>
+                );
+              }
+              if (lastTestResult.result) {
+                const color = lastTestResult.result === 'PASS' ? 'text-green-400' : lastTestResult.result === 'FAIL' ? 'text-red-400' : 'text-yellow-400';
+                return (
+                  <div>
+                    <div className={color + ' font-bold'}>{lastTestResult.result}</div>
+                    {lastTestResult.rootCause && <div className="text-red-300">rootCause: {lastTestResult.rootCause}</div>}
+                    {lastTestResult.reason && <div className="text-white/50">{lastTestResult.reason}</div>}
+                    {lastTestResult.targetPos && <div>target: [{lastTestResult.targetPos.join(',')}]</div>}
+                    {lastTestResult.sourcePos && <div>source: [{lastTestResult.sourcePos.join(',')}]</div>}
+                    {lastTestResult.testLightBlockKey && <div>light: {lastTestResult.testLightBlockKey} (id={lastTestResult.testLightBlockId})</div>}
+                    {lastTestResult.cellsLitByRawBlockLight !== undefined && <div>cellsLit: {lastTestResult.cellsLitByRawBlockLight} | cleared: {lastTestResult.cellsClearedAfterRemoval}</div>}
+                    {lastTestResult.recoloredMeshes !== undefined && <div>recolored: {lastTestResult.recoloredMeshes} | staleBefore: {lastTestResult.staleMeshesBefore ?? 0} | staleAfter: {lastTestResult.staleMeshesAfter ?? 0}</div>}
+                    {lastTestResult.queueBefore !== undefined && <div>queue: {lastTestResult.queueBefore}→{lastTestResult.queueAfter} | affectedQueued: {lastTestResult.affectedQueuedChunksBefore ?? 0}→{lastTestResult.affectedQueuedChunksAfter ?? 0}</div>}
+                    {lastTestResult.visualTintedVertices !== undefined && <div>tintedVerts: {lastTestResult.visualTintedVertices} | changedNoLight: {lastTestResult.changedNoLightVertices ?? 0}</div>}
+                    {lastTestResult.skySaturated !== undefined && <div>skySaturated: {String(lastTestResult.skySaturated)} | rawChanged: {String(lastTestResult.rawBlockLightChanged)}</div>}
+                    {lastTestResult.chain && (
+                      <div className="mt-1 border-t border-white/10 pt-1">
+                        <div className="text-[#00f2ff] font-bold">CHAIN:</div>
+                        {Object.entries(lastTestResult.chain).map(([k, v]: [string, any]) => (
+                          <div key={k} className={v === 'OK' ? 'text-green-400' : v === 'FAIL' ? 'text-red-400' : 'text-white/40'}>
+                            {k}: {v}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    {lastTestResult.emissive !== undefined && (
+                      <div className="mt-1">emissive: {String(lastTestResult.emissive)} | registered: {String(lastTestResult.registeredSource)} | mag: {lastTestResult.blockLightMagnitude}</div>
+                    )}
+                  </div>
+                );
+              }
+              if (Array.isArray(lastTestResult)) {
+                const passes = lastTestResult.filter((r: any) => r.result === 'PASS').length;
+                const fails = lastTestResult.filter((r: any) => r.result === 'FAIL').length;
+                const inc = lastTestResult.filter((r: any) => r.result === 'INCONCLUSIVE').length;
+                return (
+                  <div>
+                    <div className={fails > 0 ? 'text-red-400 font-bold' : 'text-green-400 font-bold'}>
+                      {passes} PASS, {fails} FAIL, {inc} INCONCLUSIVE
+                    </div>
+                    {lastTestResult.filter((r: any) => r.result !== 'PASS').slice(0, 3).map((r: any, i: number) => (
+                      <div key={i} className="text-red-300">
+                        step {r.stepIndex}: ({r.worldPos?.join(',')}) {r.result} — {r.rootCause || r.reason || ''}
+                      </div>
+                    ))}
+                  </div>
+                );
+              }
+              return <div>{JSON.stringify(lastTestResult).slice(0, 300)}...</div>;
+            })()}
+            <button
+              onClick={() => console.log('[Full Test Result]', lastTestResult)}
+              className="text-[7px] text-[#00f2ff]/60 hover:text-[#00f2ff] underline mt-1"
+            >
+              Log full JSON to console
+            </button>
+          </div>
+        )}
+      </Section>
+
       <Section title="Export / Import">
         <div className="flex gap-1">
           <Button
