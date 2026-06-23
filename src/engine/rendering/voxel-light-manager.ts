@@ -262,6 +262,9 @@ export class VoxelLightManager {
     "performance_voxel";
   private disposed = false;
 
+  /** World origin offset — set by adapter each tick so VLM can convert between world and local coords. */
+  private worldOriginOffset: [number, number, number] = [0, 0, 0];
+
   constructor(
     resolver: BlockLightResolver,
     getBlockAt: (x: number, y: number, z: number) => number
@@ -269,6 +272,87 @@ export class VoxelLightManager {
     this.resolver = resolver;
     this.getBlockAt = getBlockAt;
     console.log("[VoxelLightManager] Online. Performance voxel lighting mode (Minecraft-style, additive tint).");
+  }
+
+  /** Set the current world origin offset (called by adapter each tick). */
+  public setWorldOriginOffset(offset: [number, number, number]): void {
+    this.worldOriginOffset = offset;
+  }
+
+  // =====================================================================
+  // CANONICAL COORDINATE HELPERS
+  // ---------------------------------------------------------------------
+  // ARCHITECTURE (FIX for MIXED_WORLD_LOCAL_COORDINATES):
+  //   VLM logical data is WORLD-space everywhere:
+  //     - chunkLight keys        = WORLD chunk coords (cx,cy,cz)
+  //     - voxelLightSources      = WORLD cell coords (x,y,z)
+  //     - sampleLight input      = WORLD coords
+  //     - computeInitialLight    = WORLD chunk origin
+  //   Only the RENDERING side (mesh matching / recoloring) converts the
+  //   mesh's LOCAL render position (mesh.position, which noa rebases) back
+  //   to WORLD by adding worldOriginOffset.
+  //
+  //   noa facts (verified in node_modules/noa-engine):
+  //     - originRebaseDistance: 25  (rebase after walking ~25 blocks)
+  //     - Rendering._rebaseOrigin does mesh.position.subtractInPlace(delta)
+  //       => mesh.position is LOCAL after rebase
+  //     - world.getBlockID / noa.getBlock take WORLD coords (storage is
+  //       world-space, NOT rebased)
+  //     - worldDataNeeded emits WORLD chunk origins
+  // =====================================================================
+
+  /** Current world origin offset (set by adapter each tick from noa.worldOriginOffset). */
+  public getWorldOriginOffset(): [number, number, number] {
+    return [this.worldOriginOffset[0], this.worldOriginOffset[1], this.worldOriginOffset[2]];
+  }
+
+  /** Convert LOCAL render coords → WORLD coords (add offset). */
+  public localToWorld(lx: number, ly: number, lz: number): [number, number, number] {
+    return [lx + this.worldOriginOffset[0], ly + this.worldOriginOffset[1], lz + this.worldOriginOffset[2]];
+  }
+
+  /** Convert WORLD coords → LOCAL render coords (subtract offset). */
+  public worldToLocal(x: number, y: number, z: number): [number, number, number] {
+    return [x - this.worldOriginOffset[0], y - this.worldOriginOffset[1], z - this.worldOriginOffset[2]];
+  }
+
+  /** WORLD coords → WORLD chunk coords (cx,cy,cz). Uses Math.floor for correct
+   *  negative handling (chunk -1 spans world -16..-1). */
+  public worldToChunkCoord(worldX: number, worldY: number, worldZ: number): [number, number, number] {
+    return [
+      Math.floor(worldX / CHUNK_SIZE),
+      Math.floor(worldY / CHUNK_SIZE),
+      Math.floor(worldZ / CHUNK_SIZE),
+    ];
+  }
+
+  /** WORLD coords → WORLD chunk key "cx,cy,cz". */
+  public worldToChunkKey(worldX: number, worldY: number, worldZ: number): string {
+    const [cx, cy, cz] = this.worldToChunkCoord(worldX, worldY, worldZ);
+    return this.chunkKey(cx, cy, cz);
+  }
+
+  /** A Babylon terrain mesh's LOCAL render origin (mesh.position, rounded to
+   *  guard against float drift) → WORLD origin. mesh.position is LOCAL after
+   *  noa rebase, so we add worldOriginOffset to recover the WORLD origin. */
+  public meshLocalOriginToWorld(mesh: any): [number, number, number] {
+    const ox = mesh && mesh.position ? Math.round(mesh.position.x) : 0;
+    const oy = mesh && mesh.position ? Math.round(mesh.position.y) : 0;
+    const oz = mesh && mesh.position ? Math.round(mesh.position.z) : 0;
+    return this.localToWorld(ox, oy, oz);
+  }
+
+  /** A Babylon terrain mesh → its WORLD chunk key "cx,cy,cz".
+   *  This is the canonical way to match a rendered mesh to VLM WORLD-space
+   *  chunkLight data. Uses Math.round( worldOrigin / 16 ) because worldOrigin
+   *  is an exact multiple of 16 (world chunk origins always are) and float
+   *  drift can make it e.g. 15.9999999. */
+  public terrainMeshToWorldChunkKey(mesh: any): string {
+    const [wox, woy, woz] = this.meshLocalOriginToWorld(mesh);
+    const cx = Math.round(wox / CHUNK_SIZE);
+    const cy = Math.round(woy / CHUNK_SIZE);
+    const cz = Math.round(woz / CHUNK_SIZE);
+    return this.chunkKey(cx, cy, cz);
   }
 
   // ---- Chunk light data lifecycle ------------------------------------------
@@ -332,11 +416,17 @@ export class VoxelLightManager {
     const level = Math.max(1, Math.min(15, Math.round((blockDef.light.intensity ?? 1) * 7)));
     const col = blockDef.light.color || blockDef.color || [1, 1, 1];
     const r = col[0], g = col[1], b = col[2];
+    // CANONICAL: source registry stores WORLD coords. (Previously stored LOCAL
+    // via worldToLocal, which mixed with the WORLD coords written by
+    // registerSourcesFromVoxels / recomputeChunkLightFromWorld and broke
+    // removal + cross-chunk seeding after noa rebase.)
     this.voxelLightSources.set(this.cellKey(x, y, z), { x, y, z, level, r, g, b });
   }
 
-  /** Unregister a voxel light source (block destroyed). */
+  /** Unregister a voxel light source (block destroyed). WORLD coords. */
   public unregisterLight(x: number, y: number, z: number): void {
+    // CANONICAL: registry is WORLD-space. (Previously used worldToLocal which
+    // mismatched the WORLD keys written elsewhere → sources survived removal.)
     this.voxelLightSources.delete(this.cellKey(x, y, z));
   }
 
@@ -806,6 +896,13 @@ export class VoxelLightManager {
    * underground/cave darkness).
    */
   private sampleLight(worldX: number, worldY: number, worldZ: number): SampledLight {
+    // CANONICAL: input is WORLD coordinates. VLM chunk data is WORLD-keyed
+    // (chunkLight keys = floor(worldChunkOrigin/16), set by computeInitialLight
+    // from worldDataNeeded's WORLD origins). recolorMesh converts its mesh
+    // LOCAL vertex positions to WORLD (mesh.position + worldOriginOffset)
+    // before calling computeAdditiveLighting → sampleLight, so no conversion
+    // is needed here. (Previously the param was named localX and the comment
+    // claimed LOCAL space — that was the mixed-coordinate bug.)
     const fx = Math.floor(worldX);
     const fy = Math.floor(worldY);
     const fz = Math.floor(worldZ);
@@ -1046,10 +1143,29 @@ export class VoxelLightManager {
       let blockLitVertices = 0;
       let maxBlockTint = 0;
 
+      // CANONICAL COORDINATE FIX: chunkOriginX/Y/Z is the mesh's LOCAL render
+      // origin (== mesh.position, which noa rebases via subtractInPlace(delta)
+      // once the player walks >originRebaseDistance=25 blocks). Convert to WORLD
+      // before computing vertex world positions so sampleLight (WORLD-space
+      // chunkLight) reads the correct chunk even after rebase. THIS is the fix
+      // for "block light turns off after walking into nearby chunks".
+      const off = this.worldOriginOffset;
+      const worldOriginX = chunkOriginX + off[0];
+      const worldOriginY = chunkOriginY + off[1];
+      const worldOriginZ = chunkOriginZ + off[2];
+
+      // Visual-artifact diagnostics: bbox of tinted vertices + distance from
+      // nearest registered source. Used to detect farTintDetected /
+      // unexpectedLargePlaneTint — raw metrics can PASS while the visible
+      // result shows huge light planes/bands, and those must be FAIL.
+      let tintMinX = Infinity, tintMinY = Infinity, tintMinZ = Infinity;
+      let tintMaxX = -Infinity, tintMaxY = -Infinity, tintMaxZ = -Infinity;
+      let tintedVertexCount = 0;
+
       for (let v = 0; v < numVerts; v++) {
-        const wx = positions[v * 3] + chunkOriginX;
-        const wy = positions[v * 3 + 1] + chunkOriginY;
-        const wz = positions[v * 3 + 2] + chunkOriginZ;
+        const wx = positions[v * 3] + worldOriginX;
+        const wy = positions[v * 3 + 1] + worldOriginY;
+        const wz = positions[v * 3 + 2] + worldOriginZ;
 
         const baseR = baseColors[v * 4];
         const baseG = baseColors[v * 4 + 1];
@@ -1117,6 +1233,40 @@ export class VoxelLightManager {
         if (blockTintR > maxBlockTint) maxBlockTint = blockTintR;
         if (blockTintG > maxBlockTint) maxBlockTint = blockTintG;
         if (blockTintB > maxBlockTint) maxBlockTint = blockTintB;
+        // Track tinted-vertex WORLD bbox for far-tint / large-plane detection.
+        tintedVertexCount++;
+        if (wx < tintMinX) tintMinX = wx; if (wx > tintMaxX) tintMaxX = wx;
+        if (wy < tintMinY) tintMinY = wy; if (wy > tintMaxY) tintMaxY = wy;
+        if (wz < tintMinZ) tintMinZ = wz; if (wz > tintMaxZ) tintMaxZ = wz;
+      }
+
+      // Visual-artifact metrics: is the tint localized (good) or spread across
+      // a huge plane/band (bad)? farTintDetected / unexpectedLargePlaneTint
+      // override a raw PASS → FAIL when metrics lie.
+      let tintBBoxExtent = 0;
+      let farTintDetected = false;
+      let unexpectedLargePlaneTint = false;
+      let nearestSourceDistFromTintCenter = Infinity;
+      if (tintedVertexCount > 0) {
+        const ex = tintMaxX - tintMinX;
+        const ey = tintMaxY - tintMinY;
+        const ez = tintMaxZ - tintMinZ;
+        tintBBoxExtent = Math.max(ex, ey, ez);
+        // A local light should tint within ~MAX_LIGHT_RADIUS of its source. If
+        // the tinted bbox spans more than ~2 chunks (32) in any axis it's a
+        // large plane/band artifact (the bug the user photographed).
+        if (tintBBoxExtent > CHUNK_SIZE * 2) unexpectedLargePlaneTint = true;
+        const cxt = (tintMinX + tintMaxX) / 2;
+        const cyt = (tintMinY + tintMaxY) / 2;
+        const czt = (tintMinZ + tintMaxZ) / 2;
+        let minD2 = Infinity;
+        for (const src of this.voxelLightSources.values()) {
+          const ddx = src.x - cxt, ddy = src.y - cyt, ddz = src.z - czt;
+          const d2 = ddx * ddx + ddy * ddy + ddz * ddz;
+          if (d2 < minD2) minD2 = d2;
+        }
+        nearestSourceDistFromTintCenter = Math.sqrt(minD2);
+        if (nearestSourceDistFromTintCenter > MAX_LIGHT_RADIUS + 4) farTintDetected = true;
       }
 
       mesh.setVerticesData(BABYLON.VertexBuffer.ColorKind, newColors, false, 4);
@@ -1126,11 +1276,24 @@ export class VoxelLightManager {
       mesh.metadata.fpUnchangedNoLightVertices = unchangedNoLightVertices;
       mesh.metadata.fpBlockLitVertices = blockLitVertices;
       mesh.metadata.fpMaxBlockTint = maxBlockTint;
-      const cx = Math.floor(chunkOriginX / CHUNK_SIZE);
-      const cy = Math.floor(chunkOriginY / CHUNK_SIZE);
-      const cz = Math.floor(chunkOriginZ / CHUNK_SIZE);
+      // CANONICAL: chunk key from the mesh WORLD origin (not the LOCAL param).
+      const cx = Math.floor(worldOriginX / CHUNK_SIZE);
+      const cy = Math.floor(worldOriginY / CHUNK_SIZE);
+      const cz = Math.floor(worldOriginZ / CHUNK_SIZE);
       const chunkData = this.getChunkLight(cx, cy, cz);
       mesh.metadata.meshLightVersion = chunkData ? chunkData.lightDataVersion : 0;
+      // Diagnostics: record LOCAL origin, offset, WORLD origin, WORLD chunk key,
+      // and visual-artifact flags so any mesh-matching mismatch or huge light
+      // plane is immediately visible in the F3 panel / walking-light tests.
+      mesh.metadata.fpMeshLocalOrigin = [chunkOriginX, chunkOriginY, chunkOriginZ];
+      mesh.metadata.fpWorldOriginOffset = [off[0], off[1], off[2]];
+      mesh.metadata.fpMeshWorldOrigin = [worldOriginX, worldOriginY, worldOriginZ];
+      mesh.metadata.fpMeshWorldChunkKey = `${cx},${cy},${cz}`;
+      mesh.metadata.fpTintedVertexCount = tintedVertexCount;
+      mesh.metadata.fpTintBBoxExtent = tintBBoxExtent;
+      mesh.metadata.fpFarTintDetected = farTintDetected;
+      mesh.metadata.fpUnexpectedLargePlaneTint = unexpectedLargePlaneTint;
+      mesh.metadata.fpNearestSourceDistFromTintCenter = nearestSourceDistFromTintCenter;
       if (missingDataFallback) this.missingLightDataFallbackCount++;
       if (invalidColorWrite) this.invalidColorWriteCount++;
       this.meshRebuildTimestamps.push(performance.now());
@@ -1163,14 +1326,20 @@ export class VoxelLightManager {
       // but floating-point drift can make it -15.9999999. Math.floor(-15.9999) = -16
       // (correct), but Math.floor(-16.0000001) = -17 (wrong). Math.round handles
       // both cases correctly since chunk origins are always exact multiples of 16.
+      // CANONICAL: compute the mesh's WORLD chunk key (mesh.position is LOCAL
+      // after noa rebase; add worldOriginOffset). The wanted set is WORLD chunk
+      // keys (from relightAround which uses WORLD x,y,z).
+      const [wox, woy, woz] = this.meshLocalOriginToWorld(mesh);
+      const cx = Math.round(wox / CHUNK_SIZE);
+      const cy = Math.round(woy / CHUNK_SIZE);
+      const cz = Math.round(woz / CHUNK_SIZE);
+      const key = `${cx},${cy},${cz}`;
+      if (!wanted.has(key)) continue;
+      // Pass the mesh LOCAL origin (mesh.position) — recolorMesh converts to
+      // WORLD internally via worldOriginOffset.
       const ox = mesh.position ? Math.round(mesh.position.x) : 0;
       const oy = mesh.position ? Math.round(mesh.position.y) : 0;
       const oz = mesh.position ? Math.round(mesh.position.z) : 0;
-      const cx = Math.round(ox / CHUNK_SIZE);
-      const cy = Math.round(oy / CHUNK_SIZE);
-      const cz = Math.round(oz / CHUNK_SIZE);
-      const key = `${cx},${cy},${cz}`;
-      if (!wanted.has(key)) continue;
       this.recolorMesh(mesh, ox, oy, oz);
       count++;
     }
@@ -1216,9 +1385,11 @@ export class VoxelLightManager {
     for (const mesh of scene.meshes) {
       if (!mesh.name || !mesh.name.startsWith || !mesh.name.startsWith("chunk_")) continue;
       if (!mesh.isEnabled()) continue;
-      const mx = mesh.position ? Math.round(mesh.position.x / CHUNK_SIZE) : 0;
-      const my = mesh.position ? Math.round(mesh.position.y / CHUNK_SIZE) : 0;
-      const mz = mesh.position ? Math.round(mesh.position.z / CHUNK_SIZE) : 0;
+      // CANONICAL: mesh WORLD chunk coord (mesh.position is LOCAL after rebase).
+      const [wox, woy, woz] = this.meshLocalOriginToWorld(mesh);
+      const mx = Math.round(wox / CHUNK_SIZE);
+      const my = Math.round(woy / CHUNK_SIZE);
+      const mz = Math.round(woz / CHUNK_SIZE);
       // Invalidate meshes in the home chunk + ±1 neighbors.
       if (Math.abs(mx - cx) <= 1 && Math.abs(my - cy) <= 1 && Math.abs(mz - cz) <= 1) {
         if (mesh.metadata && mesh.metadata.fpBaseVertexColors) {
@@ -1244,12 +1415,11 @@ export class VoxelLightManager {
     for (const mesh of scene.meshes) {
       if (!mesh.name || !mesh.name.startsWith || !mesh.name.startsWith("chunk_")) continue;
       if (!mesh.isEnabled()) continue;
-      const ox = mesh.position ? Math.round(mesh.position.x) : 0;
-      const oy = mesh.position ? Math.round(mesh.position.y) : 0;
-      const oz = mesh.position ? Math.round(mesh.position.z) : 0;
-      const cx = Math.floor(ox / CHUNK_SIZE);
-      const cy = Math.floor(oy / CHUNK_SIZE);
-      const cz = Math.floor(oz / CHUNK_SIZE);
+      // CANONICAL: mesh WORLD chunk key (mesh.position is LOCAL after noa rebase).
+      const [wox, woy, woz] = this.meshLocalOriginToWorld(mesh);
+      const cx = Math.round(wox / CHUNK_SIZE);
+      const cy = Math.round(woy / CHUNK_SIZE);
+      const cz = Math.round(woz / CHUNK_SIZE);
       const chunkData = this.getChunkLight(cx, cy, cz);
       if (!chunkData) continue;
       const meshVersion = (mesh.metadata && mesh.metadata.meshLightVersion) ?? -1;
@@ -1534,6 +1704,11 @@ export class VoxelLightManager {
    * about the voxel light at that position and its neighbors.
    */
   public inspectLightingAt(wx: number, wy: number, wz: number): any {
+    // CANONICAL: VLM is WORLD-space. (Previously this converted world→local via
+    // worldToLocal, which read the wrong WORLD-keyed chunkLight after noa rebase
+    // — producing false "no raw block light" negatives even when the mesh
+    // recoloring correctly tinted vertices. sampleLight/brightnessAtSurface
+    // already use WORLD; this must too.)
     const cx = Math.floor(wx / CHUNK_SIZE);
     const cy = Math.floor(wy / CHUNK_SIZE);
     const cz = Math.floor(wz / CHUNK_SIZE);

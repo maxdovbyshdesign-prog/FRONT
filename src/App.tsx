@@ -21,11 +21,16 @@ import { ModLoader } from './modding/mod-loader';
 import { ModRegistry } from './modding/mod-registry';
 import { AudioService } from './audio/audio-service';
 import VisualTuningConsole from './components/VisualTuningConsole';
+import { PolygonWorldService, POLYGON_STATIONS } from './world/polygon-world-service';
+import { WorldService } from './world/world-service';
 
 export default function App() {
   const containerRef = useRef<HTMLDivElement>(null);
   const gameAppRef = useRef<GameApp | null>(null);
   const adapterRef = useRef<NoaEngineAdapter | null>(null);
+
+  // Game mode: 'menu' | 'play' | 'polygon'
+  const [gameMode, setGameMode] = useState<'menu' | 'play' | 'polygon'>('menu');
 
   // Core visual state bindings
   const [playerPos, setPlayerPos] = useState<[number, number, number]>([0, 15, 0]);
@@ -156,9 +161,10 @@ export default function App() {
     };
   }, []);
 
-  // Main game lifecycle
+  // Main game lifecycle — runs when gameMode changes to 'play' or 'polygon'
   useEffect(() => {
     if (!isModsLoaded) return;
+    if (gameMode === 'menu') return;
 
     console.log("[App] Mods loaded, starting GameApp...");
 
@@ -174,14 +180,19 @@ export default function App() {
     // 2. Mount Noa Engine
     if (containerRef.current && !adapterRef.current) {
       try {
-        console.log("[App] Mounting NoaEngineAdapter...");
+        console.log(`[App] Mounting NoaEngineAdapter (mode=${gameMode})...`);
+        // For polygon mode, create a PolygonWorldService
+        const ws = gameMode === 'polygon'
+          ? new PolygonWorldService() as unknown as WorldService
+          : gameApp.worldService;
         adapterRef.current = new NoaEngineAdapter(
           containerRef.current,
           gameApp.playerService,
-          gameApp.worldService,
+          ws,
           gameApp.blockService,
           gameApp.missionService,
-          gameApp.uiService
+          gameApp.uiService,
+          gameMode === 'polygon' ? 'polygon' : 'play'
         );
         console.log("[App] NoaEngineAdapter mounted successfully.");
         setBootError(null);
@@ -271,7 +282,7 @@ export default function App() {
       document.removeEventListener('pointerlockchange', handlePointerLockChange);
       window.removeEventListener('keydown', handleGlobalKeys);
     };
-  }, [isModsLoaded, gameApp, qaMode, visualSanityMode]);
+  }, [isModsLoaded, gameApp, qaMode, visualSanityMode, gameMode]);
 
   // Request Pointer Lock safely
   const requestLock = () => {
@@ -355,6 +366,71 @@ export default function App() {
   const uiAccent = activeTheme.accentColor || '#00f2ff';
   const uiOpacity = activeTheme.panelOpacity !== undefined ? activeTheme.panelOpacity : 0.6;
   const uiFontScale = activeTheme.fontScale !== undefined ? activeTheme.fontScale : 1.0;
+
+  // Return to main menu — destroys engine, resets state
+  const returnToMenu = () => {
+    if (adapterRef.current) {
+      adapterRef.current.destroy();
+      adapterRef.current = null;
+    }
+    setEngineReady(false);
+    setPauseMenuOpen(false);
+    setDebugMenuOpen(false);
+    setHelpOpen(false);
+    setGameMode('menu');
+  };
+
+  // ---- MAIN MENU ----
+  if (gameMode === 'menu' && !bootError) {
+    return (
+      <div className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-[#0a0a0c] text-white font-sans select-none">
+        <div className="text-center space-y-8">
+          <div>
+            <h1 className="text-5xl font-black tracking-tight uppercase">
+              FRONTIER <span className="text-[#00f2ff]">PLANET</span>
+            </h1>
+            <p className="text-xs font-mono text-white/40 tracking-widest uppercase mt-2">
+              Voxel Sci-Fi Extraction Survival RPG
+            </p>
+          </div>
+          <div className="flex flex-col gap-3 w-64">
+            <button
+              onClick={() => setGameMode('play')}
+              className="bg-[#ff6600] hover:bg-[#ff8533] active:scale-95 border border-orange-400 px-8 py-3 rounded text-sm font-black tracking-widest text-slate-950 shadow-[0_0_20px_rgba(255,102,0,0.3)] flex items-center justify-center gap-2 cursor-pointer transition-all uppercase"
+            >
+              <Crosshair className="w-4 h-4" />
+              Play Game
+            </button>
+            <button
+              onClick={() => setGameMode('polygon')}
+              className="bg-[#00f2ff]/20 hover:bg-[#00f2ff]/30 active:scale-95 border border-[#00f2ff]/40 px-8 py-3 rounded text-sm font-black tracking-widest text-[#00f2ff] shadow-[0_0_15px_rgba(0,242,255,0.2)] flex items-center justify-center gap-2 cursor-pointer transition-all uppercase"
+            >
+              <Shield className="w-4 h-4" />
+              Polygon (Test Mode)
+            </button>
+            <button
+              disabled
+              className="bg-white/5 border border-white/10 px-8 py-3 rounded text-sm font-black tracking-widest text-white/30 cursor-not-allowed uppercase"
+            >
+              Creator Mode (Coming Later)
+            </button>
+            <button
+              onClick={() => {
+                // In Electron, this would quit. In browser, just show a message.
+                if (typeof require !== 'undefined') {
+                  try { require('electron').remote.app.quit(); } catch { /* ignore */ }
+                }
+                alert('Quit unavailable in browser. Close the tab to exit.');
+              }}
+              className="bg-white/5 hover:bg-white/10 border border-white/10 px-8 py-2 rounded text-xs font-bold tracking-widest text-white/50 cursor-pointer transition-all uppercase"
+            >
+              Quit
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   if (bootError) {
     return (
@@ -495,6 +571,12 @@ export default function App() {
             >
               <RefreshCw className="w-3 h-3" />
               Redeploy
+            </button>
+            <button
+              onClick={returnToMenu}
+              className="w-full bg-white/5 hover:bg-white/10 border border-white/15 px-6 py-2.5 rounded text-[10px] font-black tracking-widest text-white/80 uppercase cursor-pointer transition-all"
+            >
+              Return to Menu
             </button>
             <p className="text-[8px] font-mono text-white/30 mt-4">World remains rendered behind this menu.</p>
           </div>

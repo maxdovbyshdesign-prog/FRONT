@@ -85,6 +85,7 @@ export interface NoaEngineInstance {
   destroy(): void;
   rendering?: any;
   camera?: any;
+  worldOriginOffset?: number[];
 }
 
 // Configurable constants for draw and render settings.
@@ -166,6 +167,8 @@ export class NoaEngineAdapter {
   private visualTuning: VisualTuning = shouldResetVisualSettings()
     ? (localStorage.removeItem("frontierPlanet.visualSettings"), { ...DEFAULT_VISUAL_TUNING })
     : loadVisualTuning();
+  /** Game mode: 'play' (procedural) or 'polygon' (flatworld test). */
+  private gameMode: 'play' | 'polygon' = 'play';
   /** Walking Light Monitor state. */
   private walkingMonitorActive: boolean = false;
   private walkingMonitorStartChunk: string = "";
@@ -193,7 +196,8 @@ export class NoaEngineAdapter {
     worldService: WorldService,
     blockService: BlockService,
     missionService: MissionService,
-    uiService: UiService
+    uiService: UiService,
+    gameMode: 'play' | 'polygon' = 'play'
   ) {
     this.containerElement = container;
     this.playerService = playerService;
@@ -201,6 +205,7 @@ export class NoaEngineAdapter {
     this.blockService = blockService;
     this.missionService = missionService;
     this.uiService = uiService;
+    this.gameMode = gameMode;
 
     // Resolve graphics quality (auto-detect, clamped to medium default).
     this.graphicsSettings = getGraphicsSettings(detectDefaultQuality());
@@ -254,7 +259,7 @@ export class NoaEngineAdapter {
     this.initializeRendering();
 
     // 6. Teleport Player to safe landing zone spawn point.
-    const spawnPos: [number, number, number] = [0, 15, 0];
+    const spawnPos: [number, number, number] = this.gameMode === 'polygon' ? [0, 10, 0] : [0, 15, 0];
     this.noa.entities.setPosition(this.noa.playerEntity, spawnPos);
     this.playerService.updatePosition(spawnPos);
 
@@ -456,9 +461,11 @@ export class NoaEngineAdapter {
         this.voxelLightManager?.recolorMesh(mesh, ox, oy, oz);
         // After recoloring the new mesh, also recolor any NEIGHBOR meshes
         // whose light data may have changed due to this chunk's geometry.
-        const cx = Math.round(ox / CHUNK_SIZE);
-        const cy = Math.round(oy / CHUNK_SIZE);
-        const cz = Math.round(oz / CHUNK_SIZE);
+        // CANONICAL: neighbor keys are WORLD chunk keys (VLM is WORLD-space;
+        // recolorAffectedMeshes matches meshes by their WORLD chunk key).
+        const wkey = this.voxelLightManager ? this.voxelLightManager.terrainMeshToWorldChunkKey(mesh) : "";
+        const wparts = wkey.split(",").map(Number);
+        const cx = wparts[0] | 0, cy = wparts[1] | 0, cz = wparts[2] | 0;
         const neighborKeys: string[] = [];
         for (let dx = -1; dx <= 1; dx++) {
           for (let dy = -1; dy <= 1; dy++) {
@@ -503,6 +510,7 @@ export class NoaEngineAdapter {
       const moonMesh = scene?.getMeshByName("fp_moon");
       const snapshot = {
         quality: adapter.graphicsSettings.quality,
+        gameMode: adapter.gameMode,
         timeOfDay: adapter.timeOfDay,
         renderDistanceBlocks: rdb,
         chunkAddDistance: adapter.chunkAddDistance,
@@ -961,6 +969,26 @@ export class NoaEngineAdapter {
         },
         /** Get walking monitor state + last result. */
         walkingMonitor: adapter.getWalkingMonitorState(),
+        /** Agent Input Pad: move player by delta. */
+        agentMove(dx: number, dz: number) { adapter.agentMove(dx, dz); },
+        /** Agent Input Pad: jump. */
+        agentJump() { adapter.agentJump(); },
+        /** Agent Input Pad: turn camera. */
+        agentTurn(deg: number) { adapter.agentTurn(deg); },
+        /** Agent Input Pad: look up/down. */
+        agentLook(deg: number) { adapter.agentLook(deg); },
+        /** Agent Input Pad: reset look. */
+        agentResetLook() { adapter.agentResetLook(); },
+        /** Agent Input Pad: cross chunk boundary +X. */
+        agentCrossChunkX() { adapter.agentCrossChunkX(); },
+        /** Agent Input Pad: cross chunk boundary +Z. */
+        agentCrossChunkZ() { adapter.agentCrossChunkZ(); },
+        /** Agent Input Pad: teleport to station (DEBUG ONLY). */
+        agentTeleportToStation(stationId: string) { return adapter.agentTeleportToStation(stationId); },
+        /** WALKING LIGHT STOP TEST: place a test light at a WORLD position, sync, return full metrics. Light stays placed (for screenshot). */
+        walkingLightStopPlace(x: number, y: number, z: number) { return adapter.walkingLightStopPlace([x, y, z]); },
+        /** WALKING LIGHT STOP TEST: remove the test light at a WORLD position, sync, verify tint cleared. */
+        walkingLightStopRemove(x: number, y: number, z: number) { return adapter.walkingLightStopRemove([x, y, z]); },
         /** Inspect the actual block under the crosshair with full chain diagnostics. */
         inspectTargetLight() {
           return adapter.inspectTargetLight();
@@ -1493,6 +1521,9 @@ export class NoaEngineAdapter {
       const sunAlt = sky.sunAltitude;
       const skyTimeMult = Math.max(0, sunAlt > 0 ? Math.sqrt(sunAlt) : 0);
       this.voxelLightManager?.setSkyLightTimeMultiplier(skyTimeMult);
+      // Sync world origin offset so VLM can convert between world and local coords.
+      const woff = this.noa.worldOriginOffset || [0, 0, 0];
+      this.voxelLightManager?.setWorldOriginOffset([woff[0], woff[1], woff[2]]);
 
       // Throttled player-position-derived updates (HUD, mission, audio).
       const nowMs = Date.now();
@@ -1801,6 +1832,218 @@ export class NoaEngineAdapter {
       }
     }
     return null;
+  }
+
+  // ---- AGENT INPUT PAD (debug movement for AI/browser testing) ----
+
+  /**
+   * Move the player by a delta using noa's entity position setter.
+   * This is NOT teleport — it moves through the normal position update path,
+   * which triggers noa's chunk loading/culling. However, it bypasses physics
+   * collision. For true walking, use WASD/pointer lock.
+   */
+  public agentMove(dx: number, dz: number): void {
+    const pos = this.getPlayerPositionSafe();
+    if (!pos) return;
+    const newX = pos[0] + dx;
+    const newZ = pos[2] + dz;
+    this.noa.entities.setPosition(this.noa.playerEntity, [newX, pos[1], newZ]);
+  }
+
+  /** Jump the player up by 2 blocks. */
+  public agentJump(): void {
+    const pos = this.getPlayerPositionSafe();
+    if (!pos) return;
+    this.noa.entities.setPosition(this.noa.playerEntity, [pos[0], pos[1] + 2, pos[2]]);
+  }
+
+  /** Turn the camera by a delta in degrees. */
+  public agentTurn(deltaDegrees: number): void {
+    const cam = (this.noa as any).camera;
+    if (!cam) return;
+    cam.heading = (cam.heading + (deltaDegrees * Math.PI / 180)) % (Math.PI * 2);
+  }
+
+  /** Look up/down by delta in degrees. */
+  public agentLook(deltaDegrees: number): void {
+    const cam = (this.noa as any).camera;
+    if (!cam) return;
+    const maxPitch = Math.PI / 2 - 0.05;
+    cam.pitch = Math.max(-maxPitch, Math.min(maxPitch, cam.pitch + (deltaDegrees * Math.PI / 180)));
+  }
+
+  /** Reset camera heading/pitch to default. */
+  public agentResetLook(): void {
+    const cam = (this.noa as any).camera;
+    if (!cam) return;
+    cam.heading = 0;
+    cam.pitch = 0;
+  }
+
+  /** Teleport to a specific station (DEBUG ONLY — not walking acceptance). */
+  public agentTeleportToStation(stationId: string): boolean {
+    const stations = this.gameMode === 'polygon'
+      ? (this.worldService as any).getStations?.() ?? []
+      : [];
+    const station = stations.find((s: any) => s.id === stationId);
+    if (!station) return false;
+    this.noa.entities.setPosition(this.noa.playerEntity, [station.pos[0], station.pos[1] + 2, station.pos[2]]);
+    return true;
+  }
+
+  // ===========================================================================
+  // WALKING LIGHT STOP TEST — the per-stop metrics harness for the Polygon
+  // walking-light stability pass. walkingLightStopPlace places a light at a
+  // WORLD position, syncs, and returns the full metrics the QA pass requires
+  // (matched meshes with meshLocalOrigin / worldOriginOffset / meshWorldOrigin
+  // / meshWorldChunkKey / matched YES/NO, tinted verts, farTintDetected,
+  // unexpectedLargePlaneTint, stale, queue). The light STAYS PLACED so the
+  // caller can screenshot the visible result. walkingLightStopRemove clears it
+  // and verifies the tint clears.
+  // ===========================================================================
+
+  /** Place a test light at a WORLD position, sync, return full stop metrics. Light stays placed. */
+  public walkingLightStopPlace(placeAt: [number, number, number]): any {
+    const sc = this.getSceneSafe();
+    const vlm = this.voxelLightManager;
+    if (!sc || !vlm) return { error: "no scene/vlm" };
+    const lightRes = this.resolveTestLightBlock();
+    if ("error" in lightRes) return { error: lightRes.error };
+    const bd = this.blockService.getBlock(lightRes.blockId);
+    if (!bd) return { error: "no block def for test light" };
+    const [px, py, pz] = placeAt;
+    this.worldService.setBlockOverride(px, py, pz, bd.id);
+    this.noa.setBlock(bd.id, px, py, pz);
+    vlm.registerLight(px, py, pz, bd);
+    const sync = this.syncBlockLightVisualsAroundSource(sc, px, py, pz, "walking stop place");
+    const inspect = vlm.inspectLightingAt(px, py, pz);
+    return this.collectWalkingStopMetrics(sc, vlm, sync, inspect, placeAt, "place");
+  }
+
+  /** Remove the test light at a WORLD position, sync, verify tint cleared. */
+  public walkingLightStopRemove(placeAt: [number, number, number]): any {
+    const sc = this.getSceneSafe();
+    const vlm = this.voxelLightManager;
+    if (!sc || !vlm) return { error: "no scene/vlm" };
+    const [px, py, pz] = placeAt;
+    this.worldService.setBlockOverride(px, py, pz, 0);
+    this.noa.setBlock(0, px, py, pz);
+    vlm.unregisterLight(px, py, pz);
+    const sync = this.syncBlockLightVisualsAroundSource(sc, px, py, pz, "walking stop remove");
+    const inspect = vlm.inspectLightingAt(px, py, pz);
+    return this.collectWalkingStopMetrics(sc, vlm, sync, inspect, placeAt, "remove");
+  }
+
+  private collectWalkingStopMetrics(
+    sc: BABYLON.Scene, vlm: any, sync: any, inspect: any,
+    placeAt: [number, number, number], phase: "place" | "remove"
+  ): any {
+    const [px, py, pz] = placeAt;
+    const playerPos = this.getPlayerPositionSafe();
+    const off: [number, number, number] = (this.noa.worldOriginOffset || [0, 0, 0]).slice() as [number, number, number];
+    const affectedSet = new Set<string>(sync.affectedChunkKeys as string[]);
+    const matchedMeshDetails: any[] = [];
+    let totalTintedVerts = 0;
+    let totalBlockLitVerts = 0;
+    let farTintAny = false;
+    let largePlaneAny = false;
+    let maxTintBBox = 0;
+    for (const m of sc.meshes) {
+      if (!m.name || !m.name.startsWith || !m.name.startsWith("chunk_")) continue;
+      if (!m.isEnabled()) continue;
+      const mKey = vlm.terrainMeshToWorldChunkKey(m);
+      if (!affectedSet.has(mKey)) continue;
+      const md: any = m.metadata || {};
+      matchedMeshDetails.push({
+        meshName: m.name,
+        meshLocalOrigin: md.fpMeshLocalOrigin || null,
+        worldOriginOffset: md.fpWorldOriginOffset || null,
+        meshWorldOrigin: md.fpMeshWorldOrigin || null,
+        meshWorldChunkKey: md.fpMeshWorldChunkKey || null,
+        matched: "YES",
+        fpBlockLitVertices: md.fpBlockLitVertices ?? 0,
+        fpTintedVertexCount: md.fpTintedVertexCount ?? 0,
+        fpTintBBoxExtent: md.fpTintBBoxExtent ?? 0,
+        fpFarTintDetected: md.fpFarTintDetected ?? false,
+        fpUnexpectedLargePlaneTint: md.fpUnexpectedLargePlaneTint ?? false,
+        fpNearestSourceDistFromTintCenter: md.fpNearestSourceDistFromTintCenter ?? null,
+        meshLightVersion: md.meshLightVersion ?? -1,
+      });
+      totalTintedVerts += md.fpTintedVertexCount ?? 0;
+      totalBlockLitVerts += md.fpBlockLitVertices ?? 0;
+      if (md.fpFarTintDetected) farTintAny = true;
+      if (md.fpUnexpectedLargePlaneTint) largePlaneAny = true;
+      if ((md.fpTintBBoxExtent ?? 0) > maxTintBBox) maxTintBBox = md.fpTintBBoxExtent ?? 0;
+    }
+    const neighbors: any[] = inspect?.neighbors || [];
+    const rawCellsLit = neighbors.filter((n: any) => Math.max(n.r || 0, n.g || 0, n.b || 0) > 0).length;
+    const maxBlockLightRGB = neighbors.length
+      ? Math.max(...neighbors.map((n: any) => Math.max(n.r || 0, n.g || 0, n.b || 0)))
+      : 0;
+    const nearbySurfaceTintVisible = totalTintedVerts > 0;
+    let result: "PASS" | "FAIL" = "FAIL";
+    let rootCause: string | null = null;
+    if (phase === "place") {
+      if (sync.recoloredMeshes === 0) { rootCause = "BLOCKLIGHT_EXISTS_BUT_NO_MATCHED_MESH"; }
+      else if (rawCellsLit === 0) { rootCause = "SOURCE_REGISTERED_BUT_NO_RAW_BLOCKLIGHT"; }
+      else if (totalTintedVerts === 0) { rootCause = "BLOCKLIGHT_EXISTS_BUT_NO_VERTEX_TINT"; }
+      else if (largePlaneAny) { rootCause = "LIGHT_ARTIFACT_LARGE_PLANE"; }
+      else if (farTintAny) { rootCause = "LIGHT_ARTIFACT_SHIFTED_OR_OFFSET"; }
+      else if (sync.staleAfter > 0) { rootCause = "BLOCKLIGHT_EXISTS_BUT_MESH_STALE"; }
+      else if (sync.affectedQueuedChunksAfter > 0) { rootCause = "BLOCKLIGHT_EXISTS_BUT_QUEUE_NOT_DRAINED"; }
+      else { result = "PASS"; }
+    } else {
+      if (maxBlockLightRGB > 0) { rootCause = "TINT_NOT_CLEARED_AFTER_REMOVE"; }
+      else if (sync.staleAfter > 0) { rootCause = "BLOCKLIGHT_EXISTS_BUT_MESH_STALE"; }
+      else { result = "PASS"; }
+    }
+    return {
+      phase,
+      playerWorldPos: playerPos ? [playerPos[0], playerPos[1], playerPos[2]] : null,
+      worldOriginOffset: [off[0], off[1], off[2]],
+      playerWorldChunk: playerPos ? vlm.worldToChunkKey(playerPos[0], playerPos[1], playerPos[2]) : null,
+      sourceWorldPos: [px, py, pz],
+      sourceWorldChunkKey: vlm.worldToChunkKey(px, py, pz),
+      affectedWorldChunkKeys: sync.affectedChunkKeys,
+      visibleMeshesNearSource: matchedMeshDetails.length,
+      matchedAffectedMeshes: matchedMeshDetails.length,
+      matchedMeshDetails,
+      rawCellsLit,
+      maxBlockLightRGB,
+      recoloredMeshes: sync.recoloredMeshes,
+      tintedVerts: totalTintedVerts,
+      staleMeshesBefore: sync.staleBefore,
+      staleMeshesAfter: sync.staleAfter,
+      affectedQueuedChunksBefore: sync.affectedQueuedChunksBefore,
+      affectedQueuedChunksAfter: sync.affectedQueuedChunksAfter,
+      maxTintBBoxExtent: maxTintBBox,
+      visualResult: {
+        nearbySurfaceTintVisible,
+        farTintDetected: farTintAny,
+        unexpectedLargePlaneTint: largePlaneAny,
+      },
+      maxBlockAfterRemove: phase === "remove" ? maxBlockLightRGB : null,
+      result,
+      rootCause,
+    };
+  }
+
+  /** Cross next chunk boundary in +X direction (moves to chunk+1). */
+  public agentCrossChunkX(): void {
+    const pos = this.getPlayerPositionSafe();
+    if (!pos) return;
+    const currentChunk = Math.floor(pos[0] / 16);
+    const targetX = (currentChunk + 1) * 16 + 0.5;
+    this.agentMove(targetX - pos[0], 0);
+  }
+
+  /** Cross next chunk boundary in +Z direction. */
+  public agentCrossChunkZ(): void {
+    const pos = this.getPlayerPositionSafe();
+    if (!pos) return;
+    const currentChunk = Math.floor(pos[2] / 16);
+    const targetZ = (currentChunk + 1) * 16 + 0.5;
+    this.agentMove(0, targetZ - pos[2]);
   }
 
   public getEngine(): NoaEngineInstance {
@@ -2452,14 +2695,20 @@ export class NoaEngineAdapter {
     const vlm = this.voxelLightManager;
     if (!vlm) return { affectedChunkKeys: [], recomputedChunks: 0, recoloredMeshes: 0, staleBefore: 0, staleAfter: 0, queueBefore: 0, queueAfter: 0, affectedQueuedChunksBefore: 0, affectedQueuedChunksAfter: 0, processedQueueChunks: 0, queueDrainIterations: 0 };
 
-    // Compute affected chunk keys by MAX_LIGHT_RADIUS (same as relightAround)
+    // Compute affected chunk keys by MAX_LIGHT_RADIUS.
+    // CANONICAL: x/y/z are WORLD coords and VLM is WORLD-space throughout, so
+    // chunk keys are WORLD. (Previously this converted world→local and passed
+    // LOCAL chunk coords to recomputeChunkNoQueue, which made
+    // recomputeChunkLightFromWorld read voxels via noa.getBlock(LOCAL origin) —
+    // reading WRONG blocks after noa rebase — producing the garbage BFS that
+    // caused the huge light plane/band artifacts the user photographed.)
     const radius = 8; // MAX_LIGHT_RADIUS
-    const minCx = Math.floor((x - radius) / 16);
-    const maxCx = Math.floor((x + radius) / 16);
-    const minCy = Math.floor((y - radius) / 16);
-    const maxCy = Math.floor((y + radius) / 16);
-    const minCz = Math.floor((z - radius) / 16);
-    const maxCz = Math.floor((z + radius) / 16);
+    const minCx = Math.floor((x - radius) / CHUNK_SIZE);
+    const maxCx = Math.floor((x + radius) / CHUNK_SIZE);
+    const minCy = Math.floor((y - radius) / CHUNK_SIZE);
+    const maxCy = Math.floor((y + radius) / CHUNK_SIZE);
+    const minCz = Math.floor((z - radius) / CHUNK_SIZE);
+    const maxCz = Math.floor((z + radius) / CHUNK_SIZE);
     const affectedChunkKeys: string[] = [];
     for (let acy = maxCy; acy >= minCy; acy--) {
       for (let acx = minCx; acx <= maxCx; acx++) {
@@ -2478,9 +2727,8 @@ export class NoaEngineAdapter {
       for (const m of scene.meshes) {
         if (!m.name || !m.name.startsWith("chunk_")) continue;
         if (!m.isEnabled()) continue;
-        const ox = Math.round(m.position.x), oy = Math.round(m.position.y), oz = Math.round(m.position.z);
-        const mcx = Math.round(ox / 16), mcy = Math.round(oy / 16), mcz = Math.round(oz / 16);
-        if (mcx === cx && mcy === cy && mcz === cz) {
+        const mKey = vlm.terrainMeshToWorldChunkKey(m);
+        if (mKey === key) {
           const meshVer = m.metadata?.meshLightVersion ?? -1;
           if (meshVer < chunkVer) staleBefore++;
         }
@@ -2497,9 +2745,9 @@ export class NoaEngineAdapter {
     }
 
     // Recompute light data for affected chunks (top-down by Y) WITHOUT
-    // cross-chunk queueing. This is the key fix: each chunk is recomputed
-    // independently, seeding from the global voxelLightSources registry.
-    // No BFS edge-crossing → no queue regeneration → no endless cascade.
+    // cross-chunk queueing. Chunk keys are WORLD (VLM is WORLD-space).
+    // recomputeChunkNoQueue → recomputeChunkLightFromWorld reads voxels via
+    // noa.getBlock(worldOrigin + lx) which is correct (noa.getBlock is WORLD).
     let recomputedChunks = 0;
     for (let acy = maxCy; acy >= minCy; acy--) {
       for (let acx = minCx; acx <= maxCx; acx++) {
@@ -2526,9 +2774,8 @@ export class NoaEngineAdapter {
       for (const m of scene.meshes) {
         if (!m.name || !m.name.startsWith("chunk_")) continue;
         if (!m.isEnabled()) continue;
-        const ox = Math.round(m.position.x), oy = Math.round(m.position.y), oz = Math.round(m.position.z);
-        const mcx = Math.round(ox / 16), mcy = Math.round(oy / 16), mcz = Math.round(oz / 16);
-        if (mcx === cx && mcy === cy && mcz === cz) {
+        const mKey = vlm.terrainMeshToWorldChunkKey(m);
+        if (mKey === key) {
           const meshVer = m.metadata?.meshLightVersion ?? -1;
           if (meshVer < chunkVer) staleAfter++;
         }
@@ -2589,8 +2836,8 @@ export class NoaEngineAdapter {
 
   /** Find an air cell near the player for placing a test light. */
   private findAirNearPlayer(pos: [number, number, number]): [number, number, number] | null {
+    // pos is WORLD position. noa.getBlock works in world coords.
     const px = Math.floor(pos[0]), py = Math.floor(pos[1]), pz = Math.floor(pos[2]);
-    // Search in a small cube around player+2 (head level + above)
     for (let dy = 2; dy <= 4; dy++) {
       for (let dx = -2; dx <= 2; dx++) {
         for (let dz = -2; dz <= 2; dz++) {
@@ -2796,9 +3043,7 @@ export class NoaEngineAdapter {
       const affectedMeshes = sc.meshes.filter((m: any) => {
         if (!m.name || !m.name.startsWith('chunk_')) return false;
         if (!m.isEnabled()) return false;
-        const ox = Math.round(m.position.x), oy = Math.round(m.position.y), oz = Math.round(m.position.z);
-        const cx = Math.round(ox / 16), cy = Math.round(oy / 16), cz = Math.round(oz / 16);
-        return syncResult.affectedChunkKeys.includes(`${cx},${cy},${cz}`);
+        return syncResult.affectedChunkKeys.includes(vlm.terrainMeshToWorldChunkKey(m));
       });
       for (const m of affectedMeshes) {
         visualTintedVertices += m.metadata?.fpBlockLitVertices ?? 0;

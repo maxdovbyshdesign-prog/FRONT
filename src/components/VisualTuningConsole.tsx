@@ -919,6 +919,65 @@ export default function VisualTuningConsole() {
           />
         </div>
       </Section>
+
+      {/* Agent Input Pad */}
+      <Section title="Agent Input Pad">
+        <div className="text-white/40 text-[8px] mb-1">Mode: {liveStats?.gameMode ?? '?'}</div>
+        <div className="grid grid-cols-3 gap-1 max-w-[200px]">
+          <div></div>
+          <Button label="Fwd" onClick={() => { const d=getDbg(); if(d){const s=d(); if(s) s.agentMove(0,-1);} }} />
+          <div></div>
+          <Button label="Left" onClick={() => { const d=getDbg(); if(d){const s=d(); if(s) s.agentMove(-1,0);} }} />
+          <Button label="Jump" onClick={() => { const d=getDbg(); if(d){const s=d(); if(s) s.agentJump();} }} />
+          <Button label="Right" onClick={() => { const d=getDbg(); if(d){const s=d(); if(s) s.agentMove(1,0);} }} />
+          <div></div>
+          <Button label="Back" onClick={() => { const d=getDbg(); if(d){const s=d(); if(s) s.agentMove(0,1);} }} />
+          <div></div>
+        </div>
+        <div className="flex flex-wrap gap-1 mt-1">
+          <Button label="Turn L" onClick={() => { const d=getDbg(); if(d){const s=d(); if(s) s.agentTurn(-15);} }} />
+          <Button label="Turn R" onClick={() => { const d=getDbg(); if(d){const s=d(); if(s) s.agentTurn(15);} }} />
+          <Button label="Look Up" onClick={() => { const d=getDbg(); if(d){const s=d(); if(s) s.agentLook(10);} }} />
+          <Button label="Look Dn" onClick={() => { const d=getDbg(); if(d){const s=d(); if(s) s.agentLook(-10);} }} />
+          <Button label="Reset Look" onClick={() => { const d=getDbg(); if(d){const s=d(); if(s) s.agentResetLook();} }} />
+        </div>
+        <div className="flex flex-wrap gap-1 mt-1">
+          <Button label="Step 1" onClick={() => { const d=getDbg(); if(d){const s=d(); if(s) s.agentMove(0,-1);} }} />
+          <Button label="Walk 8" onClick={() => { const d=getDbg(); if(d){const s=d(); if(s) s.agentMove(0,-8);} }} />
+          <Button label="Walk 16" onClick={() => { const d=getDbg(); if(d){const s=d(); if(s) s.agentMove(0,-16);} }} />
+          <Button label="Cross X" onClick={() => { const d=getDbg(); if(d){const s=d(); if(s) s.agentCrossChunkX();} }} variant="primary" />
+          <Button label="Cross Z" onClick={() => { const d=getDbg(); if(d){const s=d(); if(s) s.agentCrossChunkZ();} }} variant="primary" />
+        </div>
+        {/* Station teleport (DEBUG ONLY) */}
+        <div className="text-white/40 text-[7px] mt-1">DEBUG TELEPORT (not walking acceptance):</div>
+        <div className="flex flex-wrap gap-1">
+          <Button label="Spawn" onClick={() => { const d=getDbg(); if(d){const s=d(); if(s) s.agentTeleportToStation('center');} }} />
+          <Button label="X Border" onClick={() => { const d=getDbg(); if(d){const s=d(); if(s) s.agentTeleportToStation('x_border');} }} />
+          <Button label="Z Border" onClick={() => { const d=getDbg(); if(d){const s=d(); if(s) s.agentTeleportToStation('z_border');} }} />
+          <Button label="Corner" onClick={() => { const d=getDbg(); if(d){const s=d(); if(s) s.agentTeleportToStation('corner');} }} />
+          <Button label="Negative" onClick={() => { const d=getDbg(); if(d){const s=d(); if(s) s.agentTeleportToStation('negative');} }} />
+          <Button label="Wall" onClick={() => { const d=getDbg(); if(d){const s=d(); if(s) s.agentTeleportToStation('wall');} }} />
+          <Button label="Floor" onClick={() => { const d=getDbg(); if(d){const s=d(); if(s) s.agentTeleportToStation('floor');} }} />
+          <Button label="Tunnel" onClick={() => { const d=getDbg(); if(d){const s=d(); if(s) s.agentTeleportToStation('tunnel');} }} />
+          <Button label="Fog" onClick={() => { const d=getDbg(); if(d){const s=d(); if(s) s.agentTeleportToStation('fog');} }} />
+        </div>
+      </Section>
+
+      {/* Fog Test Station */}
+      <Section title="Fog Test Station">
+        <div className="text-white/60 text-[8px]">
+          <div>fogMode: {liveStats?.fog?.fogMode}</div>
+          <div>fogStart: {liveStats?.fog?.fogStart?.toFixed(0)} | fogEnd: {liveStats?.fog?.fogEnd?.toFixed(0)}</div>
+          <div>fogColor: {liveStats?.fog?.fogColor}</div>
+        </div>
+        <div className="flex flex-wrap gap-1 mt-1">
+          <Button label="Fog Off" onClick={() => { const d=getDbg(); if(d){const s=d(); if(s) s.setFogEnabled(false);} }} />
+          <Button label="Fog Low" onClick={() => { const d=getDbg(); if(d){const s=d(); if(s){ s.updateVisualTuning({fogEnabled:true, fogStart:80, fogEnd:120}); }}}} />
+          <Button label="Fog Med" onClick={() => { const d=getDbg(); if(d){const s=d(); if(s){ s.updateVisualTuning({fogEnabled:true, fogStart:50, fogEnd:100}); }}}} />
+          <Button label="Fog Heavy" onClick={() => { const d=getDbg(); if(d){const s=d(); if(s){ s.updateVisualTuning({fogEnabled:true, fogStart:20, fogEnd:60}); }}}} />
+          <Button label="Fog On" onClick={() => { const d=getDbg(); if(d){const s=d(); if(s) s.setFogEnabled(true);} }} variant="primary" />
+        </div>
+      </Section>
     </div>
   );
 }
