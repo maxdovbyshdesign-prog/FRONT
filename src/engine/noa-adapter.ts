@@ -10,6 +10,7 @@ import { WorldService } from '../world/world-service';
 import { BlockService } from '../blocks/block-service';
 import { MissionService } from '../missions/mission-service';
 import { UiService } from '../ui/ui-service';
+import { SurvivalService } from '../player/survival-service';
 import { GameEvent, GameEventType, BlockDefinition } from '../types';
 import { gameState } from '../game/game-state';
 import { ModRegistry } from '../modding/mod-registry';
@@ -141,6 +142,7 @@ export class NoaEngineAdapter {
   private blockService: BlockService;
   private missionService: MissionService;
   private uiService: UiService;
+  private survivalService: SurvivalService | null = null;
   private containerElement: HTMLElement;
   private isCleanup: boolean = false;
   private isSprinting: boolean = false;
@@ -197,7 +199,8 @@ export class NoaEngineAdapter {
     blockService: BlockService,
     missionService: MissionService,
     uiService: UiService,
-    gameMode: 'play' | 'polygon' = 'play'
+    gameMode: 'play' | 'polygon' = 'play',
+    survivalService: SurvivalService | null = null
   ) {
     this.containerElement = container;
     this.playerService = playerService;
@@ -206,6 +209,7 @@ export class NoaEngineAdapter {
     this.missionService = missionService;
     this.uiService = uiService;
     this.gameMode = gameMode;
+    this.survivalService = survivalService;
 
     // Resolve graphics quality (auto-detect, clamped to medium default).
     this.graphicsSettings = getGraphicsSettings(detectDefaultQuality());
@@ -1070,6 +1074,18 @@ export class NoaEngineAdapter {
         configurable: true,
       });
 
+      // ---- Survival vitals snapshot (lazy) for QA / HUD debugging ----
+      Object.defineProperty(snapshot, 'survival', {
+        get() {
+          return adapter.survivalService ? adapter.survivalService.getSnapshot() : null;
+        },
+        configurable: true,
+      });
+      Object.defineProperty(snapshot, 'playerHealth', {
+        get() { return adapter.playerService.getHealth(); },
+        configurable: true,
+      });
+
       return snapshot;
     };
 
@@ -1524,6 +1540,45 @@ export class NoaEngineAdapter {
       // Sync world origin offset so VLM can convert between world and local coords.
       const woff = this.noa.worldOriginOffset || [0, 0, 0];
       this.voxelLightManager?.setWorldOriginOffset([woff[0], woff[1], woff[2]]);
+
+      // ---- Survival vitals tick (stamina / oxygen / hydration / radiation) ----
+      // Integrates with the lighting system: oxygen drains when skyLight=0
+      // (underground/indoors), which is exactly the WORLD-space cell value VLM
+      // computes at the player position — the coordinate-space fix pays off
+      // here by giving correct skyLight even after noa rebase.
+      if (this.survivalService) {
+        const sLaPlayer = this.voxelLightManager?.getDebugInfo([pos[0], pos[1], pos[2]]).skyLightAtPlayer ?? 0;
+        const ruinCenter = this.worldService.getRuinCenter();
+        const dxArt = pos[0] - ruinCenter[0];
+        const dzArt = pos[2] - ruinCenter[2];
+        const nearArtifact = (dxArt * dxArt + dzArt * dzArt) <= 36; // within ~6 blocks
+        const nightFactor = sky.nightFactor ?? 0;
+        const damage = this.survivalService.tick(
+          {
+            dtMs,
+            sprinting: this.isSprinting,
+            skyLightAtPlayer: sLaPlayer,
+            nightFactor,
+            nearArtifact,
+            timeOfDay: this.timeOfDay,
+            polygonMode: this.gameMode === 'polygon',
+          },
+          (msg, type) => this.uiService.emitAlert(msg, type)
+        );
+        if (damage > 0) {
+          this.playerService.damagePlayer(damage);
+        }
+        // Mirror snapshot into gameState for the React HUD (polled at 12.5Hz).
+        gameState.survival = this.survivalService.getSnapshot();
+        // Enforce stamina sprint lock: if stamina exhausted, force-walk.
+        if (this.isSprinting && !gameState.survival.canSprint) {
+          const moveState = this.getMovementSafe();
+          if (moveState) {
+            moveState.maxSpeed = 10.0;
+            this.isSprinting = false;
+          }
+        }
+      }
 
       // Throttled player-position-derived updates (HUD, mission, audio).
       const nowMs = Date.now();

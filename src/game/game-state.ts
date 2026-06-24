@@ -4,6 +4,7 @@
  */
 
 import { VoxelPosition } from '../types';
+import type { SurvivalSnapshot } from '../player/survival-service';
 
 export interface GameState {
   playerPosition: VoxelPosition;
@@ -18,6 +19,8 @@ export interface GameState {
   extracted: boolean;
   worldSeed: number;
   changedBlocks: Map<string, number>; // key: "x,y,z" -> blockId
+  /** Survival vitals snapshot, mirrored by SurvivalService each tick for the HUD. */
+  survival: SurvivalSnapshot;
 }
 
 export const gameState: GameState = {
@@ -36,4 +39,16 @@ export const gameState: GameState = {
   extracted: false,
   worldSeed: 12345,
   changedBlocks: new Map<string, number>(),
+  survival: {
+    stamina: 100,
+    oxygen: 100,
+    hydration: 100,
+    radiation: 0,
+    status: 'nominal',
+    canSprint: true,
+    lowStamina: false,
+    lowOxygen: false,
+    lowHydration: false,
+    highRadiation: false,
+  },
 };

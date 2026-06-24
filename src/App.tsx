@@ -4,14 +4,20 @@
  */
 
 import { useEffect, useRef, useState } from 'react';
-import { 
-  Compass, 
-  Award, 
-  AlertTriangle, 
-  Info, 
-  Crosshair, 
-  Shield, 
-  RefreshCw 
+import {
+  Compass,
+  Award,
+  AlertTriangle,
+  Info,
+  Crosshair,
+  Shield,
+  RefreshCw,
+  Heart,
+  Zap,
+  Wind,
+  Droplet,
+  Radiation,
+  Activity
 } from 'lucide-react';
 import { GameApp } from './game/app';
 import { NoaEngineAdapter } from './engine/noa-adapter';
@@ -36,6 +42,9 @@ export default function App() {
   const [playerPos, setPlayerPos] = useState<[number, number, number]>([0, 15, 0]);
   const [playerYaw, setPlayerYaw] = useState<number>(0);
   const [targetedBlockInfo, setTargetedBlockInfo] = useState<string>('None');
+  // Survival vitals re-render tick (bumped at ~10Hz so the HUD reads fresh
+  // gameState.survival values mirrored by SurvivalService each engine tick).
+  const [, setSurvivalTick] = useState<number>(0);
 
   // Initialize GameApp singleton
   if (!gameAppRef.current) {
@@ -153,6 +162,13 @@ export default function App() {
         }
         return prev;
       });
+
+      // Bump survival re-render tick (only when in-game so the menu isn't
+      // pointlessly re-rendering). Reads the mutable gameState.survival
+      // snapshot mirrored by SurvivalService each engine tick.
+      if (gameState.survival) {
+        setSurvivalTick((t) => (t + 1) & 0xffff);
+      }
     };
 
     intervalId = window.setInterval(updateUIState, 80);
@@ -192,7 +208,8 @@ export default function App() {
           gameApp.blockService,
           gameApp.missionService,
           gameApp.uiService,
-          gameMode === 'polygon' ? 'polygon' : 'play'
+          gameMode === 'polygon' ? 'polygon' : 'play',
+          gameApp.survivalService
         );
         console.log("[App] NoaEngineAdapter mounted successfully.");
         setBootError(null);
@@ -718,22 +735,75 @@ export default function App() {
           
           <div className="flex justify-between items-end w-full gap-5">
             
-            {/* Bottom Left: Coordinates Readout Card */}
-            <div className="border p-4 rounded-lg w-64 shadow-2xl pointer-events-auto backdrop-blur-md space-y-3"
+            {/* Bottom Left: Survival Vitals + Coordinates Readout Card */}
+            <div className="border p-4 rounded-lg w-72 shadow-2xl pointer-events-auto backdrop-blur-md space-y-3"
               style={{ backgroundColor: `rgba(0,0,0,${uiOpacity})`, borderColor: `${uiAccent}30` }}>
-              <div className="w-full">
-                <div className="flex justify-between text-[9px] uppercase font-bold mb-1">
-                  <span className="text-[#ff4444] tracking-widest flex items-center gap-1">
-                    <Shield className="w-3 h-3" /> LIFE SYSTEMS
-                  </span>
-                  <span className="text-white/80">100% NOMINAL</span>
-                </div>
-                <div className="h-1 w-full bg-white/10 rounded-full overflow-hidden">
-                  <div className="h-full bg-[#ff4444]" style={{ width: '100%' }} />
-                </div>
+              {/* Status crest header */}
+              <div className="flex items-center justify-between border-b border-white/10 pb-2">
+                <span className="text-[9px] uppercase font-black tracking-widest flex items-center gap-1.5" style={{ color: uiAccent }}>
+                  <Activity className="w-3 h-3" /> VITAL SIGNS
+                </span>
+                <span className={`text-[8px] font-mono font-bold px-1.5 py-0.5 rounded uppercase tracking-wider ${
+                  gameState.survival.status === 'nominal' ? 'bg-emerald-500/20 text-emerald-400' :
+                  gameState.survival.status === 'warn' ? 'bg-amber-500/20 text-amber-400 animate-pulse' :
+                  'bg-red-500/20 text-red-400 animate-pulse'
+                }`}>
+                  {gameState.survival.status}
+                </span>
               </div>
 
-              <div className="w-full">
+              {/* Health bar (primary — from PlayerService) */}
+              <VitalBar
+                icon={<Heart className="w-3 h-3" />}
+                label="HEALTH"
+                value={gameApp.playerService.getHealth()}
+                color="#ff4444"
+                lowThreshold={25}
+                criticalThreshold={10}
+              />
+              {/* Stamina */}
+              <VitalBar
+                icon={<Zap className="w-3 h-3" />}
+                label="STAMINA"
+                value={gameState.survival.stamina}
+                color="#ffd633"
+                lowThreshold={25}
+                criticalThreshold={10}
+                disabled={!gameState.survival.canSprint && gameState.survival.stamina < 5}
+              />
+              {/* Oxygen — integrates with the lighting system (skyLight=0 → drains) */}
+              <VitalBar
+                icon={<Wind className="w-3 h-3" />}
+                label="OXYGEN"
+                value={gameState.survival.oxygen}
+                color="#33ccff"
+                lowThreshold={25}
+                criticalThreshold={10}
+              />
+              {/* Hydration */}
+              <VitalBar
+                icon={<Droplet className="w-3 h-3" />}
+                label="HYDRATION"
+                value={gameState.survival.hydration}
+                color="#33aaff"
+                lowThreshold={25}
+                criticalThreshold={10}
+              />
+              {/* Radiation — inverted: high is bad */}
+              <VitalBar
+                icon={<Radiation className="w-3 h-3" />}
+                label="RADIATION"
+                value={gameState.survival.radiation}
+                color="#a855f7"
+                lowThreshold={0}
+                criticalThreshold={0}
+                inverted
+                highThreshold={60}
+                dangerThreshold={75}
+              />
+
+              {/* GPS telemetry divider */}
+              <div className="border-t border-white/10 pt-2">
                 <div className="flex justify-between text-[9px] uppercase font-bold mb-1">
                   <span className="tracking-widest flex items-center gap-1" style={{ color: uiAccent }}>
                     <Compass className="w-3 h-3" /> GPS TELEMETRY
@@ -911,6 +981,67 @@ export default function App() {
           )}
         </div>
       )}
+    </div>
+  );
+}
+
+// ---- VitalBar — a single survival vital bar with low/critical state styling ----
+interface VitalBarProps {
+  icon: React.ReactNode;
+  label: string;
+  value: number; // 0..100
+  color: string;
+  lowThreshold: number;
+  criticalThreshold: number;
+  /** For radiation: high is bad. The bar fills toward danger. */
+  inverted?: boolean;
+  highThreshold?: number;
+  dangerThreshold?: number;
+  /** Dimmed + lock icon when stamina is exhausted (sprint locked). */
+  disabled?: boolean;
+}
+
+function VitalBar({ icon, label, value, color, lowThreshold, criticalThreshold, inverted, highThreshold, dangerThreshold, disabled }: VitalBarProps) {
+  const v = Math.max(0, Math.min(100, value));
+  let state: 'normal' | 'low' | 'critical' | 'high' | 'danger' = 'normal';
+  if (inverted) {
+    if (dangerThreshold != null && v >= dangerThreshold) state = 'danger';
+    else if (highThreshold != null && v >= highThreshold) state = 'high';
+  } else {
+    if (v < criticalThreshold) state = 'critical';
+    else if (v < lowThreshold) state = 'low';
+  }
+  const pulse = state === 'critical' || state === 'danger';
+  const barColor =
+    state === 'critical' || state === 'danger' ? '#ff2222' :
+    state === 'low' || state === 'high' ? '#ffaa00' : color;
+  return (
+    <div className={`w-full ${pulse ? 'animate-pulse' : ''}`}>
+      <div className="flex justify-between text-[9px] uppercase font-bold mb-1 items-center">
+        <span className="tracking-widest flex items-center gap-1" style={{ color: disabled ? 'rgba(255,255,255,0.25)' : barColor }}>
+          {icon} {label}
+          {disabled && <span className="text-[7px] text-red-400 ml-1">LOCK</span>}
+        </span>
+        <span className="font-mono" style={{ color: disabled ? 'rgba(255,255,255,0.3)' : barColor }}>
+          {Math.round(v)}{inverted ? ' rad' : '%'}
+        </span>
+      </div>
+      <div className="h-1.5 w-full bg-white/10 rounded-full overflow-hidden relative">
+        <div
+          className="h-full rounded-full transition-all duration-200"
+          style={{
+            width: `${v}%`,
+            backgroundColor: barColor,
+            boxShadow: pulse ? `0 0 6px ${barColor}` : 'none',
+          }}
+        />
+        {/* Tick marks every 25% for a gauge feel */}
+        <div className="absolute inset-0 flex pointer-events-none">
+          {[25, 50, 75].map(t => (
+            <div key={t} className="absolute top-0 bottom-0 w-px bg-black/40" style={{ left: `${t}%` }} />
+          ))}
+        </div>
+      </div>
     </div>
   );
 }

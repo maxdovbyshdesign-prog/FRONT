@@ -9,6 +9,7 @@ import { BlockService } from '../blocks/block-service';
 import { MissionService } from '../missions/mission-service';
 import { UiService } from '../ui/ui-service';
 import { InputService } from '../player/input-service';
+import { SurvivalService } from '../player/survival-service';
 
 // Placeholders
 import { InventoryService } from '../player/inventory-service';
@@ -36,6 +37,7 @@ export class GameApp {
   public missionService: MissionService;
   public uiService: UiService;
   public inputService: InputService;
+  public survivalService: SurvivalService;
 
   // Extension Readiness Placeholders
   public inventoryService: InventoryService;
@@ -64,6 +66,7 @@ export class GameApp {
     this.missionService = new MissionService();
     this.uiService = new UiService();
     this.inputService = new InputService(this.playerService);
+    this.survivalService = new SurvivalService();
 
     // Boot Extension Placeholders
     this.inventoryService = new InventoryService();
@@ -128,6 +131,7 @@ export class GameApp {
     console.log('[GameApp] Resetting raid environment...');
     this.missionService.resetMission();
     this.playerService.healPlayer(100);
+    this.survivalService.reset();
     this.uiService.emitAlert('Re-inserted into Frontier Planet drop-zone. Good luck.', 'info');
   }
 }
