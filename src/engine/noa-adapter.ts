@@ -40,6 +40,12 @@ import {
   saveVisualTuning,
   NAMED_PRESETS,
 } from './rendering/visual-tuning';
+import { PrecipitationFieldRenderer } from './weather/precipitation-field-renderer';
+import {
+  DEFAULT_PRECIPITATION_FIELD_CONFIG,
+  POLYGON_TEST_ROOF,
+  type PrecipitationFieldDebugInfo,
+} from './weather/precipitation-field-types';
 
 /**
  * Minimal internal interface mapping for the 3D noa-engine
@@ -183,6 +189,7 @@ export class NoaEngineAdapter {
   private renderPipelineService: RenderPipelineService | null = null;
   private worldLightManager: WorldLightManager | null = null;
   private skyController: SkyController | null = null;
+  private precipitationFieldRenderer: PrecipitationFieldRenderer | null = null;
   /**
    * VoxelLightManager — Minecraft-style per-cell baked lighting (skyLight +
    * RGB blockLight flood-fill). This is the PERFORMANCE lighting model: light
@@ -488,6 +495,16 @@ export class NoaEngineAdapter {
     // Apply the initial visual preset (fog / clearColor / ambient tuning).
     this.applyAtmosphereForCurrentPhase([0, 15, 0]);
 
+    if (this.gameMode === 'polygon') {
+      this.precipitationFieldRenderer = new PrecipitationFieldRenderer(scene, {}, (mesh) => {
+        const octMgr = (this.noa.rendering as any)?._octreeManager;
+        if (octMgr && typeof octMgr.addMesh === "function") {
+          octMgr.addMesh(mesh, false);
+        }
+      });
+      console.log('[NoaEngineAdapter] Abstract Precipitation Field ready (Polygon only, disabled).');
+    }
+
     // Start ambient desert synthesized audio loop on first user interaction.
     const clickStartAudio = () => {
       AudioService.getInstance().playAmbientDesert();
@@ -515,6 +532,7 @@ export class NoaEngineAdapter {
       const snapshot = {
         quality: adapter.graphicsSettings.quality,
         gameMode: adapter.gameMode,
+        abstractPrecipitation: adapter.getAbstractPrecipitationDebugInfo(),
         timeOfDay: adapter.timeOfDay,
         renderDistanceBlocks: rdb,
         chunkAddDistance: adapter.chunkAddDistance,
@@ -973,6 +991,22 @@ export class NoaEngineAdapter {
         },
         /** Get walking monitor state + last result. */
         walkingMonitor: adapter.getWalkingMonitorState(),
+        /** Polygon-only abstract falling field controls. */
+        setAbstractPrecipitationEnabled(enabled: boolean) {
+          return adapter.setAbstractPrecipitationEnabled(enabled);
+        },
+        toggleAbstractPrecipitation() {
+          return adapter.toggleAbstractPrecipitation();
+        },
+        cycleAbstractPrecipitationWind() {
+          return adapter.cycleAbstractPrecipitationWind();
+        },
+        toggleAbstractPrecipitationShelter() {
+          return adapter.toggleAbstractPrecipitationShelter();
+        },
+        getAbstractPrecipitationInfo() {
+          return adapter.getAbstractPrecipitationDebugInfo();
+        },
         /** Agent Input Pad: move player by delta. */
         agentMove(dx: number, dz: number) { adapter.agentMove(dx, dz); },
         /** Agent Input Pad: jump. */
@@ -1192,6 +1226,43 @@ export class NoaEngineAdapter {
     return this.getVisualTuning();
   }
 
+  /** Polygon-only abstract field toggle. Does nothing in Play Game. */
+  public setAbstractPrecipitationEnabled(enabled: boolean): boolean {
+    if (this.gameMode !== 'polygon' || !this.precipitationFieldRenderer) {
+      return false;
+    }
+    this.precipitationFieldRenderer.setEnabled(enabled);
+    return enabled;
+  }
+
+  /** Polygon-only abstract field toggle. Returns the new enabled state. */
+  public toggleAbstractPrecipitation(): boolean {
+    if (this.gameMode !== 'polygon' || !this.precipitationFieldRenderer) {
+      return false;
+    }
+    return this.precipitationFieldRenderer.toggle();
+  }
+
+  /** Cycles between two simple prototype wind vectors. */
+  public cycleAbstractPrecipitationWind(): [number, number, number] | null {
+    if (this.gameMode !== 'polygon' || !this.precipitationFieldRenderer) {
+      return null;
+    }
+    return this.precipitationFieldRenderer.cycleWind();
+  }
+
+  /** Toggle the prototype roof reduction after open-sky visibility is confirmed. */
+  public toggleAbstractPrecipitationShelter(): string | null {
+    if (this.gameMode !== 'polygon' || !this.precipitationFieldRenderer) {
+      return null;
+    }
+    return this.precipitationFieldRenderer.toggleShelterMode();
+  }
+
+  public getAbstractPrecipitationDebugInfo(): PrecipitationFieldDebugInfo | { available: false; enabled: false } {
+    return this.precipitationFieldRenderer?.getDebugInfo() ?? { available: false, enabled: false };
+  }
+
   /**
    * Force a bright unlit debug material onto all chunk_ meshes.
    * When enabled: saves original materials, assigns a bright orange unlit mat.
@@ -1233,6 +1304,52 @@ export class NoaEngineAdapter {
   /** Actual render distance in blocks (chunkAddDistance × chunkSize). */
   public getRenderDistanceBlocks(): number {
     return this.chunkAddDistance * CHUNK_SIZE;
+  }
+
+  private updateAbstractPrecipitation(
+    dtMs: number,
+    playerWorldPos: [number, number, number],
+    worldOriginOffset: [number, number, number]
+  ): void {
+    if (this.gameMode !== 'polygon' || !this.precipitationFieldRenderer) return;
+    const scene = this.getSceneSafe();
+    const cam = scene?.activeCamera;
+    if (!cam) return;
+
+    const absPos = (cam as any).getAbsolutePosition ? (cam as any).getAbsolutePosition() : cam.position;
+    this.precipitationFieldRenderer.update({
+      dtMs,
+      cameraLocalPosition: [absPos.x, absPos.y, absPos.z],
+      playerWorldPosition: playerWorldPos,
+      worldOriginOffset,
+      shelterFactor: this.getAbstractPrecipitationShelterFactor(playerWorldPos),
+    });
+  }
+
+  private getAbstractPrecipitationShelterFactor(playerWorldPos: [number, number, number]): number {
+    const [x, y, z] = playerWorldPos;
+    const [cx, cy, cz] = POLYGON_TEST_ROOF.center;
+    const [hx, , hz] = POLYGON_TEST_ROOF.halfSize;
+    const underTestRoof =
+      Math.abs(x - cx) <= hx &&
+      Math.abs(z - cz) <= hz &&
+      y <= cy + 0.5;
+
+    if (underTestRoof) {
+      return DEFAULT_PRECIPITATION_FIELD_CONFIG.shelterReduction;
+    }
+
+    const wx = Math.floor(x);
+    const wz = Math.floor(z);
+    const startY = Math.floor(y) + 2;
+    const endY = Math.floor(y) + 8;
+    for (let wy = startY; wy <= endY; wy++) {
+      if (this.getBlockIdAt(wx, wy, wz) !== 0) {
+        return DEFAULT_PRECIPITATION_FIELD_CONFIG.shelterReduction;
+      }
+    }
+
+    return 1;
   }
 
   private setupWorldDataHandler(): void {
@@ -1540,6 +1657,11 @@ export class NoaEngineAdapter {
       // Sync world origin offset so VLM can convert between world and local coords.
       const woff = this.noa.worldOriginOffset || [0, 0, 0];
       this.voxelLightManager?.setWorldOriginOffset([woff[0], woff[1], woff[2]]);
+      this.updateAbstractPrecipitation(
+        dtMs,
+        [pos[0], pos[1], pos[2]],
+        [woff[0], woff[1], woff[2]]
+      );
 
       // ---- Survival vitals tick (stamina / oxygen / hydration / radiation) ----
       // Integrates with the lighting system: oxygen drains when skyLight=0
@@ -3502,6 +3624,8 @@ export class NoaEngineAdapter {
     try { this.worldLightManager?.dispose(); } catch (e) { console.warn('[NoaEngineAdapter] WorldLightManager dispose:', e); }
     try { this.skyController?.dispose(); } catch (e) { console.warn('[NoaEngineAdapter] SkyController dispose:', e); }
     try { this.renderPipelineService?.dispose(); } catch (e) { console.warn('[NoaEngineAdapter] RenderPipelineService dispose:', e); }
+    try { this.precipitationFieldRenderer?.dispose(); } catch (e) { console.warn('[NoaEngineAdapter] Abstract field dispose:', e); }
+    this.precipitationFieldRenderer = null;
 
     try {
       this.noa.destroy();

@@ -920,6 +920,29 @@ export default function VisualTuningConsole() {
         </div>
       </Section>
 
+      <Section title="Abstract Field">
+        <div className="bg-black/40 rounded p-1.5 text-[8px] text-white/60 font-mono space-y-0.5">
+          <div>available: {String(liveStats?.abstractPrecipitation?.available ?? false)} | enabled: {String(liveStats?.abstractPrecipitation?.enabled ?? false)}</div>
+          <div>count: {liveStats?.abstractPrecipitation?.elementCount ?? '?'} | visible: {liveStats?.abstractPrecipitation?.visibleCount ?? '?'}</div>
+          <div>alpha: {liveStats?.abstractPrecipitation?.activeAlpha ?? '?'} | shelterActive: {String(liveStats?.abstractPrecipitation?.shelterActive ?? false)}</div>
+          <div>wind: {liveStats?.abstractPrecipitation?.wind ? `[${liveStats.abstractPrecipitation.wind.join(', ')}]` : '?'}</div>
+          <div>shelter: {liveStats?.abstractPrecipitation?.shelterFactor ?? '?'} | mode: {liveStats?.abstractPrecipitation?.shelterMode ?? '?'}</div>
+          <div>center: {liveStats?.abstractPrecipitation?.cameraLocalPosition ? `[${liveStats.abstractPrecipitation.cameraLocalPosition.map((v: number) => v.toFixed(1)).join(', ')}]` : '?'}</div>
+          <div>sample: {liveStats?.abstractPrecipitation?.sampleElementLocalPosition ? `[${liveStats.abstractPrecipitation.sampleElementLocalPosition.map((v: number) => v.toFixed(1)).join(', ')}]` : '?'}</div>
+        </div>
+        <div className="flex flex-wrap gap-1 mt-1">
+          <Button label="Field On" onClick={() => { const d=getDbg(); if(d){const s=d(); if(s) s.setAbstractPrecipitationEnabled?.(true);} }} variant="primary" />
+          <Button label="Field Off" onClick={() => { const d=getDbg(); if(d){const s=d(); if(s) s.setAbstractPrecipitationEnabled?.(false);} }} />
+          <Button label="Toggle" onClick={() => { const d=getDbg(); if(d){const s=d(); if(s) s.toggleAbstractPrecipitation?.();} }} />
+          <Button label="Wind" onClick={() => { const d=getDbg(); if(d){const s=d(); if(s) s.cycleAbstractPrecipitationWind?.();} }} />
+          <Button label="Shelter" onClick={() => { const d=getDbg(); if(d){const s=d(); if(s) s.toggleAbstractPrecipitationShelter?.();} }} />
+          <Button label="Roof" onClick={() => { const d=getDbg(); if(d){const s=d(); if(s) s.agentTeleportToStation?.('wall');} }} />
+        </div>
+        <div className="text-white/40 text-[8px] mt-0.5">
+          Polygon-only grey falling field renderer test.
+        </div>
+      </Section>
+
       {/* Agent Input Pad */}
       <Section title="Agent Input Pad">
         <div className="text-white/40 text-[8px] mb-1">Mode: {liveStats?.gameMode ?? '?'}</div>
